@@ -16,7 +16,9 @@ class Settings(BaseSettings):
 
     AMAZON_SP_CLIENT_ID: str = ""
     AMAZON_SP_CLIENT_SECRET: str = ""
-    AMAZON_SP_REFRESH_TOKEN: str = ""
+    AMAZON_SP_REFRESH_TOKEN_NA: str = ""
+    AMAZON_SP_REFRESH_TOKEN_EU: str = ""
+    AMAZON_SP_REFRESH_TOKEN_FE: str = ""
 
     AMAZON_ADS_CLIENT_ID: str = ""
     AMAZON_ADS_CLIENT_SECRET: str = ""
