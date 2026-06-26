@@ -36,6 +36,46 @@ MARKETPLACE_REGION: dict[str, Region] = {
     "A39IBJ37TRP1C6": "FE",  # AU
 }
 
+MARKETPLACE_CHANNEL: dict[str, str] = {
+    "ATVPDKIKX0DER": "amazon_us",
+    "A2EUQ1WTGCTBG2": "amazon_ca",
+    "A1AM78C64UM0Y8": "amazon_mx",
+    "A1F83G8C2ARO7P": "amazon_uk",
+    "A39IBJ37TRP1C6": "amazon_au",
+}
+
+MARKETPLACE_CURRENCY: dict[str, str] = {
+    "ATVPDKIKX0DER": "USD",
+    "A2EUQ1WTGCTBG2": "CAD",
+    "A1AM78C64UM0Y8": "MXN",
+    "A1F83G8C2ARO7P": "GBP",
+    "A39IBJ37TRP1C6": "AUD",
+}
+
+# Inverse of MARKETPLACE_CURRENCY. SP-API ServiceFee + Adjustment events
+# often arrive without a MarketplaceName but always with a CurrencyCode, so
+# currency is a reliable second-best attribution signal.
+CURRENCY_TO_MARKETPLACE: dict[str, str] = {v: k for k, v in MARKETPLACE_CURRENCY.items()}
+
+# SP-API embeds MarketplaceName (not Id) in most events. This maps the
+# display-name strings back to canonical marketplace IDs so the ETL can
+# attribute region-shared events to the right marketplace.
+MARKETPLACE_NAME_TO_ID: dict[str, str] = {
+    "Amazon.com": "ATVPDKIKX0DER",
+    "Amazon.ca": "A2EUQ1WTGCTBG2",
+    "Amazon.com.mx": "A1AM78C64UM0Y8",
+    "Amazon.co.uk": "A1F83G8C2ARO7P",
+    "Amazon.com.au": "A39IBJ37TRP1C6",
+}
+
+# For events with no MarketplaceName (region-level subscription / storage),
+# attribute to the region's primary marketplace.
+REGION_PRIMARY_MARKETPLACE: dict[Region, str] = {
+    "NA": "ATVPDKIKX0DER",
+    "EU": "A1F83G8C2ARO7P",
+    "FE": "A39IBJ37TRP1C6",
+}
+
 SALES_RATE = RateLimit(requests_per_second=0.5)
 FINANCES_RATE = RateLimit(requests_per_second=0.5)
 REPORTS_RATE = RateLimit(requests_per_second=0.0167)

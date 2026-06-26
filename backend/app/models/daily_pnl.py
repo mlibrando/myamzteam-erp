@@ -40,7 +40,9 @@ class DailyPnL(Base, TimestampMixin):
 
     gross_profit_no_reimb: Mapped[Decimal] = mapped_column(DECIMAL(12, 2), nullable=False, default=0)
     gross_profit_with_reimb: Mapped[Decimal] = mapped_column(DECIMAL(12, 2), nullable=False, default=0)
-    margin_pct: Mapped[Decimal] = mapped_column(DECIMAL(5, 2), nullable=False, default=0)
+    # Wide enough (±999,999.99) to hold pathological days where service-fee
+    # lumping or near-zero sales produces extreme margins.
+    margin_pct: Mapped[Decimal] = mapped_column(DECIMAL(8, 2), nullable=False, default=0)
 
     sales_usd: Mapped[Decimal] = mapped_column(DECIMAL(12, 2), nullable=False, default=0)
     gross_profit_usd: Mapped[Decimal] = mapped_column(DECIMAL(12, 2), nullable=False, default=0)
