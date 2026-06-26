@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import health
+from app.api.routes import etl, health
 from app.config import settings
 from app.database import engine
 
@@ -32,6 +32,7 @@ app.add_middleware(
 )
 
 app.include_router(health.router, prefix="/api", tags=["health"])
+app.include_router(etl.router, prefix="/api", tags=["etl"])
 
 
 @app.get("/")

@@ -6,6 +6,7 @@ from app.models.financial_events import FinancialEvent
 from app.models.product_cogs import ProductCogs
 from app.models.raw_api_log import RawApiLog
 from app.models.shopify_sales import ShopifySale
+from app.models.unmapped_line_items import UnmappedLineItem
 
 __all__ = [
     "Base",
@@ -16,4 +17,5 @@ __all__ = [
     "RawApiLog",
     "ProductCogs",
     "CurrencyRate",
+    "UnmappedLineItem",
 ]
