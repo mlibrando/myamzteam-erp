@@ -22,7 +22,9 @@ class Settings(BaseSettings):
 
     AMAZON_ADS_CLIENT_ID: str = ""
     AMAZON_ADS_CLIENT_SECRET: str = ""
-    AMAZON_ADS_REFRESH_TOKEN: str = ""
+    AMAZON_ADS_REFRESH_TOKEN_NA: str = ""
+    AMAZON_ADS_REFRESH_TOKEN_EU: str = ""
+    AMAZON_ADS_REFRESH_TOKEN_FE: str = ""
 
     SHOPIFY_STORE_URL: str = ""
     SHOPIFY_API_KEY: str = ""
