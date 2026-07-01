@@ -119,11 +119,19 @@ async def main() -> int:
         b, a = before[k], after[k]
         print(f"  {k:>22}  {_fmt(b)}  {_fmt(a)}  {_fmt(a - b)}")
 
-    # Elena's Jan 2026 US targets (approximate). Print gap-to-Elena for the
-    # three categories the reconciliation is expected to affect.
-    print("\n[Elena target vs after]")
-    elena = {"sales": Decimal("175191.94"), "selling_fees": Decimal("51401"),
-             "operational_fees": Decimal("5722")}
+    # Elena's Jan 2026 US targets, from her RAW_AMZ_US sheet (2026-07-01
+    # snapshot). Values stored as MAGNITUDE (positive) matching daily_pnl
+    # storage convention — daily_pnl stores expenses as positive
+    # magnitudes; Elena's signed values are the negative of these.
+    print("\n[Elena target vs after — daily_pnl magnitude convention]")
+    elena = {
+        "sales": Decimal("175191.94"),
+        "selling_fees": Decimal("51401"),        # Elena signed: -51401
+        "operational_fees": Decimal("14912.08"),  # Elena signed: -14912.08
+        # Reimbursements: Elena's Sellerise formula excludes Reversal +
+        # Warehouse-Lost, so her target after those exclusions is ~$1,442.
+        "reimbursements": Decimal("1442"),
+    }
     for k, target in elena.items():
         gap = after[k] - target
         pct = float(gap / target * 100) if target != 0 else 0.0

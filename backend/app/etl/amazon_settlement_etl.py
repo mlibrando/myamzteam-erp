@@ -266,12 +266,21 @@ async def run_amazon_settlement_ingestion(
     # captured.
     utc_start, utc_end = date_range_utc(window_start_pt, window_end_pt + timedelta(days=1))
     # Settlement reports are created shortly after the settlement group's
-    # end. A report covering the last few days of the target window may
-    # not exist until several days later. Widen the createdSince to two
-    # months before the window to catch reports that cover its early days.
-    created_since = (utc_start - timedelta(days=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    # createdUntil is 15 days past window_end to include reports created
-    # for late-window settlements.
+    # end (delivery lag ~1-2 days). A report covering the last few days
+    # of the target window may not exist until ~2 weeks later, so we
+    # widen createdUntil by 15 days. For createdSince: Amazon's Reports
+    # API rejects any value more than 90 days old (RequestedFromDate
+    # >90 days -> 400 InvalidInput), so cap the earliest we ask for at
+    # 89 days back from now. If the target window is entirely outside
+    # the 90-day-back cutoff, list_reports will return nothing and the
+    # ETL is a no-op — that's expected. Callers should run this ETL
+    # monthly (or more often) so it always reaches back to CURRENT
+    # settlement reports that are inside the window.
+    now = datetime.now(timezone.utc)
+    earliest_allowed = now - timedelta(days=89)
+    desired_created_since = utc_start - timedelta(days=30)
+    created_since_dt = max(desired_created_since, earliest_allowed)
+    created_since = created_since_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     created_until = (utc_end + timedelta(days=15)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     deleted = await _purge_settlement_rows(
