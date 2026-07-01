@@ -9,7 +9,11 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.connectors.amazon_sp import MARKETPLACE_REGION
-from app.database import get_db
+from app.database import AsyncSessionLocal, get_db
+from app.etl.amazon_ads_etl import (
+    ALL_MARKETPLACES as ADS_ALL_MARKETPLACES,
+    run_amazon_ads_etl,
+)
 from app.etl.amazon_etl import ALL_MARKETPLACES, run_amazon_etl
 from app.etl.pnl_calculator import calculate_daily_pnl
 
@@ -92,4 +96,78 @@ async def run_amazon(
         }
 
     await db.commit()
+    return AmazonEtlResponse(etl=etl_summary.to_dict(), pnl=pnl_summary)
+
+
+class AmazonAdsEtlRequest(BaseModel):
+    start_date: date
+    end_date: date
+    marketplace_ids: list[str] | None = Field(
+        default=None,
+        description="If omitted, runs for all five marketplaces.",
+    )
+    skip_pnl_calc: bool = False
+
+    @field_validator("end_date")
+    @classmethod
+    def _end_after_start(cls, v: date, info: Any) -> date:
+        start = info.data.get("start_date")
+        if start and v < start:
+            raise ValueError("end_date must be >= start_date")
+        return v
+
+    @field_validator("marketplace_ids")
+    @classmethod
+    def _validate_marketplaces(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return v
+        unknown = [m for m in v if m not in MARKETPLACE_REGION]
+        if unknown:
+            raise ValueError(f"unknown marketplace_ids: {unknown}")
+        return v
+
+
+@router.post("/etl/amazon-ads/run", response_model=AmazonEtlResponse)
+async def run_amazon_ads(
+    request: AmazonAdsEtlRequest,
+) -> AmazonEtlResponse:
+    """Runs the Ads ETL with the app-level session_maker (not a request-scoped
+    session) because report polling can take up to 10 minutes per report; a
+    single session held that long would be dropped by the Postgres proxy."""
+    marketplaces = request.marketplace_ids or list(ADS_ALL_MARKETPLACES)
+    logger.info(
+        "ads_etl_route start=%s end=%s marketplaces=%s",
+        request.start_date,
+        request.end_date,
+        marketplaces,
+    )
+    try:
+        etl_summary = await run_amazon_ads_etl(
+            AsyncSessionLocal,
+            start_date=request.start_date,
+            end_date=request.end_date,
+            marketplace_ids=marketplaces,
+        )
+    except Exception as exc:
+        logger.exception("ads_etl_route failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"amazon ads ETL failed: {exc}",
+        ) from exc
+
+    pnl_summary: dict[str, Any] = {"skipped": True}
+    if not request.skip_pnl_calc:
+        async with AsyncSessionLocal() as session:
+            pnl_calc = await calculate_daily_pnl(
+                session,
+                start_date=request.start_date,
+                end_date=request.end_date,
+                marketplace_ids=marketplaces,
+            )
+            await session.commit()
+        pnl_summary = {
+            "rows_written": pnl_calc.rows_written,
+            "skus_without_cogs": pnl_calc.skus_without_cogs,
+        }
+
     return AmazonEtlResponse(etl=etl_summary.to_dict(), pnl=pnl_summary)

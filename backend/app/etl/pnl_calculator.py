@@ -1,13 +1,22 @@
-"""Aggregate financial_events into daily_pnl rows.
+"""Aggregate financial_events + ad_spend into daily_pnl rows.
 
-Reads from financial_events (populated by amazon_etl), groups by
-(posted_date date-only, marketplace_id), sums per-category fee_amount values,
-looks up COGS from product_cogs * net units shipped per SKU, applies the
-configured FX rate to compute USD-normalized fields, and upserts daily_pnl
-on the (date, channel) unique key.
+Reads from:
+  - financial_events (populated by amazon_etl) for sales, fees, refunds,
+    reimbursements
+  - product_cogs * net units shipped, for COGS
+  - ad_spend (populated by amazon_ads_etl) for ad_spend / ad_spend_sp /
+    ad_spend_sb / ad_spend_sd / ad_spend_sv
+  - currency_rates for USD normalization
 
-AD_SPEND is intentionally excluded -- the daily_pnl.ad_spend column is owned
-by PR 4's Amazon Ads ETL.
+Upserts daily_pnl on (date, channel). Each call is idempotent over the
+window: the calculator reads all four sources fresh and overwrites the
+existing row.
+
+If only one of {financial_events, ad_spend} has data for a given (date,
+marketplace), that day still gets a row -- whichever source is missing
+contributes zeros. This means running the Ads ETL before the SP-API ETL
+will still produce a daily_pnl row (with sales=0 etc.), and the next
+SP-API run will fill in the missing fields.
 """
 
 from __future__ import annotations
@@ -29,7 +38,28 @@ from app.connectors.amazon_sp import (
     MARKETPLACE_REGION,
 )
 from app.etl.pnl_mapping import PnlCategory
-from app.models import CurrencyRate, DailyPnL, FinancialEvent, ProductCogs
+from app.models import AdSpend, CurrencyRate, DailyPnL, FinancialEvent, ProductCogs
+
+
+# ad_spend.platform values for the four Amazon ad products (SV = Sponsored
+# Videos, a future-work product that doesn't have an ETL yet but the column
+# exists in daily_pnl).
+AD_SPEND_PLATFORM_TO_COLUMN: dict[str, str] = {
+    "amazon_sp": "ad_spend_sp",
+    "amazon_sb": "ad_spend_sb",
+    "amazon_sd": "ad_spend_sd",
+    "amazon_sv": "ad_spend_sv",
+}
+
+# ad_spend.marketplace is the lowercase short code (us, ca, mx, uk, au).
+# Convert to the canonical Amazon marketplace_id used everywhere else.
+SHORT_CODE_TO_MARKETPLACE: dict[str, str] = {
+    "us": "ATVPDKIKX0DER",
+    "ca": "A2EUQ1WTGCTBG2",
+    "mx": "A1AM78C64UM0Y8",
+    "uk": "A1F83G8C2ARO7P",
+    "au": "A39IBJ37TRP1C6",
+}
 
 logger = logging.getLogger(__name__)
 
@@ -177,6 +207,55 @@ async def _load_active_cogs(
     return {key: cost for key, (_, cost) in latest.items()}
 
 
+async def _aggregate_ad_spend(
+    session: AsyncSession,
+    *,
+    start_date: date,
+    end_date: date,
+    marketplace_ids: Iterable[str],
+) -> dict[tuple[date, str], dict[str, Decimal]]:
+    """Sum spend per (date, marketplace, platform) for the window.
+
+    Returns: {(day, marketplace_id): {platform_column: spend, ...}}
+    where platform_column is the daily_pnl column name (ad_spend_sp, ...).
+    Unknown platforms are silently ignored (e.g. 'meta' from PR 8 lands in
+    daily_pnl via a different path).
+    """
+    short_codes = [
+        code for code, mp in SHORT_CODE_TO_MARKETPLACE.items() if mp in marketplace_ids
+    ]
+    if not short_codes:
+        return {}
+    stmt = (
+        select(
+            AdSpend.date,
+            AdSpend.marketplace,
+            AdSpend.platform,
+            func.coalesce(func.sum(AdSpend.spend), 0),
+        )
+        .where(
+            and_(
+                AdSpend.marketplace.in_(short_codes),
+                AdSpend.platform.in_(list(AD_SPEND_PLATFORM_TO_COLUMN.keys())),
+                AdSpend.date >= start_date,
+                AdSpend.date <= end_date,
+            )
+        )
+        .group_by(AdSpend.date, AdSpend.marketplace, AdSpend.platform)
+    )
+    result = await session.execute(stmt)
+    out: dict[tuple[date, str], dict[str, Decimal]] = defaultdict(
+        lambda: {col: _DEC_ZERO for col in AD_SPEND_PLATFORM_TO_COLUMN.values()}
+    )
+    for day, short_code, platform, total in result.all():
+        marketplace_id = SHORT_CODE_TO_MARKETPLACE.get(short_code)
+        if marketplace_id is None:
+            continue
+        column = AD_SPEND_PLATFORM_TO_COLUMN[platform]
+        out[(day, marketplace_id)][column] = Decimal(str(total))
+    return out
+
+
 async def _load_fx_rates(
     session: AsyncSession,
     *,
@@ -224,6 +303,9 @@ async def calculate_daily_pnl(
     net_units = await _aggregate_net_units(
         session, start_date=start_date, end_date=end_date, marketplace_ids=marketplaces
     )
+    ad_spend_totals = await _aggregate_ad_spend(
+        session, start_date=start_date, end_date=end_date, marketplace_ids=marketplaces
+    )
 
     cogs_keys = {MARKETPLACE_COGS_KEY[m] for m in marketplaces}
     cogs_table = await _load_active_cogs(session, cogs_keys=cogs_keys)
@@ -249,9 +331,15 @@ async def calculate_daily_pnl(
         cogs_per_dm[(day, marketplace)] += unit_cost * Decimal(units)
     summary.skus_without_cogs = sorted(missing_cogs)
 
-    # Build the set of (day, marketplace) keys to write -- union of category-totals
-    # and cogs-per-dm. A day with COGS but no events still gets a row.
-    days_marketplaces: set[tuple[date, str]] = set(category_totals.keys()) | set(cogs_per_dm.keys())
+    # Build the set of (day, marketplace) keys to write -- union of all
+    # source-data keys. A day with only ad spend (or only COGS) still gets
+    # a row so the spend isn't lost; SP-API fields stay at 0 until the
+    # next financial-events ETL run.
+    days_marketplaces: set[tuple[date, str]] = (
+        set(category_totals.keys())
+        | set(cogs_per_dm.keys())
+        | set(ad_spend_totals.keys())
+    )
 
     for day, marketplace_id in sorted(days_marketplaces):
         cats = category_totals.get((day, marketplace_id), {})
@@ -262,7 +350,13 @@ async def calculate_daily_pnl(
         reimbursements = Decimal(str(cats.get(PnlCategory.REIMBURSEMENTS.value, _DEC_ZERO)))
         cogs = cogs_per_dm.get((day, marketplace_id), _DEC_ZERO)
 
-        ad_spend = _DEC_ZERO  # populated by PR 4
+        ad_spend_cols = ad_spend_totals.get((day, marketplace_id), {})
+        ad_spend_sp = ad_spend_cols.get("ad_spend_sp", _DEC_ZERO)
+        ad_spend_sb = ad_spend_cols.get("ad_spend_sb", _DEC_ZERO)
+        ad_spend_sd = ad_spend_cols.get("ad_spend_sd", _DEC_ZERO)
+        ad_spend_sv = ad_spend_cols.get("ad_spend_sv", _DEC_ZERO)
+        ad_spend = ad_spend_sp + ad_spend_sb + ad_spend_sd + ad_spend_sv
+
         gross_profit_no_reimb = (
             sales - cogs - ad_spend - selling_fees - operational_fees - refunds
         )
@@ -285,10 +379,10 @@ async def calculate_daily_pnl(
             sales=_round_money(sales),
             cogs=_round_money(cogs),
             ad_spend=_round_money(ad_spend),
-            ad_spend_sp=_DEC_ZERO,
-            ad_spend_sb=_DEC_ZERO,
-            ad_spend_sd=_DEC_ZERO,
-            ad_spend_sv=_DEC_ZERO,
+            ad_spend_sp=_round_money(ad_spend_sp),
+            ad_spend_sb=_round_money(ad_spend_sb),
+            ad_spend_sd=_round_money(ad_spend_sd),
+            ad_spend_sv=_round_money(ad_spend_sv),
             selling_fees=_round_money(selling_fees),
             operational_fees=_round_money(operational_fees),
             refunds=_round_money(refunds),

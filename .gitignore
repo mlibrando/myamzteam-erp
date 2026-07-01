@@ -48,3 +48,12 @@ yarn-error.log*
 
 # Misc
 .cache/
+
+# Local docs / planning (kept out of the repo)
+*.md
+!README.md
+
+# Spreadsheets / local data
+*.xlsx
+*.xls
+*.csv
