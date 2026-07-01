@@ -178,7 +178,7 @@ async def test_financial_events_paginate_and_merge_lists() -> None:
             }
         }
         events_route = mock.get(
-            f"{base}/finances/v0/financialEvents/group-1"
+            f"{base}/finances/v0/financialEventGroups/group-1/financialEvents"
         ).mock(
             side_effect=[httpx.Response(200, json=page1), httpx.Response(200, json=page2)]
         )

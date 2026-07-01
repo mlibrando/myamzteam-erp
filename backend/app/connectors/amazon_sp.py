@@ -256,13 +256,18 @@ class AmazonSPConnector(BaseConnector):
         posted_after: str | None = None,
         posted_before: str | None = None,
     ) -> dict[str, list[dict[str, Any]]]:
-        """GET /finances/v0/financialEvents/{eventGroupId}, paginated to exhaustion.
+        """GET /finances/v0/financialEventGroups/{eventGroupId}/financialEvents.
 
-        Requires the SP-API "Finance and Accounting" data role on the LWA app and
-        only serves groups whose ProcessingStatus is Closed (Open groups 403).
-        For day-by-day P&L use `get_financial_events_by_date` instead.
+        Paginated to exhaustion. The path is `.../financialEventGroups/{id}/financialEvents`
+        (NOT `.../financialEvents/{id}` — that misspelled variant returns
+        401/403 "Unauthorized" instead of 404, which historically misled us
+        into thinking this endpoint required an additional data role).
+
+        Only serves Closed groups; Open groups typically return an empty
+        payload or 400. For day-by-day P&L use `get_financial_events_by_date`
+        instead — by-group is for month-end reconciliation.
         """
-        path = f"/finances/v0/financialEvents/{event_group_id}"
+        path = f"/finances/v0/financialEventGroups/{event_group_id}/financialEvents"
         base_params: dict[str, Any] = {"MaxResultsPerPage": max_results_per_page}
         if posted_after is not None:
             base_params["PostedAfter"] = posted_after
