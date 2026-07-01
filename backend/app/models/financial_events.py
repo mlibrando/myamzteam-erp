@@ -41,4 +41,13 @@ class FinancialEvent(Base, TimestampMixin):
     raw_amount: Mapped[Decimal | None] = mapped_column(DECIMAL(12, 2), nullable=True)
     quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
     currency: Mapped[str | None] = mapped_column(String(3), nullable=True)
+    # Which SP-API path produced this row. The reconciliation ETL uses this
+    # to safely replace less-authoritative rows without touching the others
+    # (delete-and-insert per source for the same window):
+    #   - financial_events_by_date  = daily amazon_etl
+    #   - financial_events_by_group = monthly by-group reconciliation
+    #   - settlement                = settlement report ingestion
+    source: Mapped[str] = mapped_column(
+        String(40), nullable=False, server_default="financial_events_by_date", index=True
+    )
     raw_payload: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)

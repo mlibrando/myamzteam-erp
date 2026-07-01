@@ -45,6 +45,7 @@ from app.etl.pnl_mapping import (
     lookup_shipment_item_fee,
     normalize_amount,
 )
+from app.etl.timezone_utils import date_range_utc
 from app.models import FinancialEvent, RawApiLog, UnmappedLineItem
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,16 @@ logger = logging.getLogger(__name__)
 ALL_MARKETPLACES: tuple[str, ...] = tuple(MARKETPLACE_REGION.keys())
 
 FINANCES_ENDPOINT_PATH = "/finances/v0/financialEvents"
+FINANCES_BY_GROUP_ENDPOINT_PATH = "/finances/v0/financialEventGroups"
+
+# financial_events.source values. Each daily/reconciliation/settlement path
+# tags its rows so the reconciliation ETL can DELETE by source before
+# INSERT-ing new rows (see run_amazon_by_group_reconciliation) — this
+# preserves the "authoritative source replaces less authoritative source
+# for the same window" invariant without a fragile row-level upsert.
+SOURCE_BY_DATE = "financial_events_by_date"
+SOURCE_BY_GROUP = "financial_events_by_group"
+SOURCE_SETTLEMENT = "settlement"
 
 
 @dataclass
@@ -624,10 +635,13 @@ async def _purge_existing_rows(
     window_start: datetime,
     window_end: datetime,
     marketplace_ids: Iterable[str],
+    source: str,
 ) -> None:
-    """Delete prior financial_events and unmapped_line_items rows for the
-    given marketplaces and posted-date window. Re-running the ETL for the
-    same window therefore yields exactly one set of rows -- no duplicates."""
+    """Delete prior financial_events + unmapped_line_items rows for the given
+    marketplaces, posted-date window, AND source. Re-running the same ETL
+    yields exactly one set of rows (no duplicates). A different-source ETL
+    (e.g. by-group reconciliation) never touches by-date rows via this call
+    — it uses the source-scoped variant below."""
     mp_list = list(marketplace_ids)
     await session.execute(
         delete(FinancialEvent).where(
@@ -635,6 +649,7 @@ async def _purge_existing_rows(
                 FinancialEvent.marketplace_id.in_(mp_list),
                 FinancialEvent.posted_date >= window_start,
                 FinancialEvent.posted_date < window_end,
+                FinancialEvent.source == source,
             )
         )
     )
@@ -655,6 +670,7 @@ def _persist_line_item(
     *,
     endpoint: str,
     summary: AmazonEtlSummary,
+    source: str,
 ) -> None:
     summary.line_items_total += 1
     if item.marketplace_id:
@@ -706,6 +722,7 @@ def _persist_line_item(
             raw_amount=item.raw_amount,
             quantity=item.quantity,
             currency=item.currency,
+            source=source,
             raw_payload=item.raw_payload,
         )
     )
@@ -773,6 +790,7 @@ async def run_amazon_etl(
         window_start=window_start,
         window_end=window_end,
         marketplace_ids=marketplaces,
+        source=SOURCE_BY_DATE,
     )
 
     # Group requested marketplaces by region so we pull each region once.
@@ -818,18 +836,292 @@ async def run_amazon_etl(
                 item,
                 endpoint=FINANCES_ENDPOINT_PATH,
                 summary=summary,
+                source=SOURCE_BY_DATE,
             )
 
     await session.flush()
     return summary
 
 
+# -----------------------------------------------------------------------------
+# By-group reconciliation
+# -----------------------------------------------------------------------------
+
+
+@dataclass
+class ByGroupReconciliationSummary:
+    """Structured result of one by-group reconciliation pass."""
+
+    marketplace_ids: list[str] = field(default_factory=list)
+    window_start_pt: date | None = None
+    window_end_pt: date | None = None
+    groups_listed: int = 0
+    groups_closed_in_window: int = 0
+    groups_processed: int = 0
+    events_pulled: int = 0
+    line_items_total: int = 0
+    line_items_mapped: int = 0
+    line_items_unmapped: int = 0
+    by_category: dict[str, int] = field(default_factory=dict)
+    by_marketplace: dict[str, int] = field(default_factory=dict)
+    rows_deleted_by_date: int = 0
+    rows_inserted_by_group: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "marketplace_ids": list(self.marketplace_ids),
+            "window_start_pt": self.window_start_pt.isoformat() if self.window_start_pt else None,
+            "window_end_pt": self.window_end_pt.isoformat() if self.window_end_pt else None,
+            "groups_listed": self.groups_listed,
+            "groups_closed_in_window": self.groups_closed_in_window,
+            "groups_processed": self.groups_processed,
+            "events_pulled": self.events_pulled,
+            "line_items_total": self.line_items_total,
+            "line_items_mapped": self.line_items_mapped,
+            "line_items_unmapped": self.line_items_unmapped,
+            "by_category": dict(self.by_category),
+            "by_marketplace": dict(self.by_marketplace),
+            "rows_deleted_by_date": self.rows_deleted_by_date,
+            "rows_inserted_by_group": self.rows_inserted_by_group,
+        }
+
+
+async def run_amazon_by_group_reconciliation(
+    session: AsyncSession,
+    *,
+    window_start_pt: date,
+    window_end_pt: date,
+    marketplace_ids: Iterable[str] | None = None,
+    connector_factory: Any = None,
+) -> ByGroupReconciliationSummary:
+    """Overwrite financial_events for a PT-local window with by-group data.
+
+    Design (per the "authoritative source replaces less authoritative source
+    for the same window" pattern):
+      1. List every FinancialEventGroup started in a broad UTC window that
+         could hold PT-local `(window_start_pt, window_end_pt)` events.
+      2. Filter to `ProcessingStatus=Closed` groups whose (start, end)
+         window overlaps the target UTC window.
+      3. For each qualifying group, GET
+         `/finances/v0/financialEventGroups/{gid}/financialEvents`
+         (the corrected by-group URL — see 8f5bac3), paginating fully.
+      4. In one transaction: DELETE existing rows where
+         `source='financial_events_by_date'` and posted_date is in the
+         widened UTC window; INSERT new rows with
+         `source='financial_events_by_group'`.
+      5. Settlement rows are NEVER touched here (they have `source='settlement'`
+         and are the topmost priority).
+
+    The by-group payload uses the same FinancialEvents shape as by-date, so
+    the same `flatten_events_payload` machinery applies unchanged. Events
+    whose posted_date falls outside the window (a group can span >window)
+    are still stored under the same source — pnl_calculator's PT-local
+    date filter drops them from daily_pnl aggregation naturally.
+    """
+    marketplaces = tuple(marketplace_ids) if marketplace_ids else ALL_MARKETPLACES
+    unknown = [m for m in marketplaces if m not in MARKETPLACE_REGION]
+    if unknown:
+        raise ValueError(f"unknown marketplace_ids: {unknown}")
+
+    summary = ByGroupReconciliationSummary(
+        marketplace_ids=list(marketplaces),
+        window_start_pt=window_start_pt,
+        window_end_pt=window_end_pt,
+    )
+
+    # UTC window that fully contains the PT-local INCLUSIVE window
+    # [window_start_pt, window_end_pt]. date_range_utc returns
+    # [start 00:00 PT, end 00:00 PT), so we advance end by one day to make
+    # the window inclusive on window_end_pt — otherwise all of PT
+    # window_end_pt would be missed by the DELETE and stay as by-date rows
+    # while their by-group counterparts land, double-counting the fees.
+    utc_start, utc_end = date_range_utc(
+        window_start_pt, window_end_pt + timedelta(days=1)
+    )
+    # Group listing needs a start date further back — a settlement group
+    # started 30 days before window_start_pt can still contain events
+    # posted in the window.
+    group_list_start = utc_start - timedelta(days=45)
+
+    regions_needed: dict[Region, list[str]] = {}
+    for mp in marketplaces:
+        region = MARKETPLACE_REGION[mp]
+        regions_needed.setdefault(region, []).append(mp)
+
+    factory = connector_factory or (lambda region: AmazonSPConnector(region=region))
+
+    # Phase 1 (short-lived): purge by-date rows for the window in one go
+    # across all marketplaces, then re-insert as we walk groups.
+    deleted = await _purge_by_source_and_window(
+        session,
+        window_start=utc_start,
+        window_end=utc_end,
+        marketplace_ids=marketplaces,
+        source=SOURCE_BY_DATE,
+    )
+    summary.rows_deleted_by_date = deleted
+    # Also purge any prior by-group rows for the same window so re-running
+    # is idempotent.
+    await _purge_by_source_and_window(
+        session,
+        window_start=utc_start,
+        window_end=utc_end,
+        marketplace_ids=marketplaces,
+        source=SOURCE_BY_GROUP,
+    )
+
+    for region, region_marketplaces in regions_needed.items():
+        region_marketplaces_set = set(region_marketplaces)
+        async with factory(region) as conn:
+            logger.info(
+                "by_group_reconciliation region=%s window=%s..%s (UTC %s..%s)",
+                region,
+                window_start_pt,
+                window_end_pt,
+                utc_start.isoformat(),
+                utc_end.isoformat(),
+            )
+            groups = await conn.get_financial_event_groups(
+                start_date=group_list_start.strftime("%Y-%m-%dT%H:%M:%SZ")
+            )
+            summary.groups_listed += len(groups)
+
+            for g in groups:
+                if g.get("ProcessingStatus") != "Closed":
+                    continue
+                gs = _parse_group_dt(g.get("FinancialEventGroupStart"))
+                ge = _parse_group_dt(g.get("FinancialEventGroupEnd"))
+                if gs is None or ge is None:
+                    continue
+                # Groups whose window doesn't overlap the target UTC window
+                # can't contribute events in the target — skip.
+                if ge < utc_start or gs >= utc_end:
+                    continue
+                summary.groups_closed_in_window += 1
+
+                gid = g["FinancialEventGroupId"]
+                logger.info(
+                    "by_group_reconciliation group=%s window=%s..%s",
+                    gid,
+                    g.get("FinancialEventGroupStart"),
+                    g.get("FinancialEventGroupEnd"),
+                )
+                payload = await conn.get_financial_events(gid)
+                summary.groups_processed += 1
+
+                _log_raw_response(
+                    session,
+                    endpoint=f"{FINANCES_BY_GROUP_ENDPOINT_PATH}/{gid}/financialEvents",
+                    region=region,
+                    payload=payload,
+                    window_start=utc_start,
+                    window_end=utc_end,
+                )
+                summary.events_pulled += _count_events(payload)
+
+                # Orphan events (ServiceFeeEvents without PostedDate — e.g.
+                # FBAInboundTransportationFee INITIAL_FEE) inherit the
+                # settlement group's END date. That's the semantically
+                # correct posting time for aggregate settlement charges,
+                # and it lines up with how Elena books these against the
+                # settlement disbursement (not the arbitrary UTC-window
+                # start we'd use in the daily ETL).
+                orphan_fallback = ge or utc_start
+                for item in flatten_events_payload(payload, region=region, default_posted=orphan_fallback):
+                    if item.marketplace_id and item.marketplace_id not in region_marketplaces_set:
+                        continue
+                    _persist_reconciliation_item(session, item, summary)
+
+    await session.flush()
+    return summary
+
+
+def _parse_group_dt(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+async def _purge_by_source_and_window(
+    session: AsyncSession,
+    *,
+    window_start: datetime,
+    window_end: datetime,
+    marketplace_ids: Iterable[str],
+    source: str,
+) -> int:
+    """DELETE financial_events matching (marketplace, source, posted_date in window).
+    Returns the number of rows deleted."""
+    mp_list = list(marketplace_ids)
+    result = await session.execute(
+        delete(FinancialEvent).where(
+            and_(
+                FinancialEvent.marketplace_id.in_(mp_list),
+                FinancialEvent.posted_date >= window_start,
+                FinancialEvent.posted_date < window_end,
+                FinancialEvent.source == source,
+            )
+        )
+    )
+    return result.rowcount or 0
+
+
+def _persist_reconciliation_item(
+    session: AsyncSession,
+    item: FlatLineItem,
+    summary: ByGroupReconciliationSummary,
+) -> None:
+    """Insert a by-group flat line item. Unlike the by-date path, we do NOT
+    log unmapped items here — the by-date ETL already wrote them for this
+    window, and re-logging would double-count. We simply drop unmapped
+    items from the reconciliation insert (they'd be zero-fee anyway)."""
+    summary.line_items_total += 1
+    if item.marketplace_id:
+        summary.by_marketplace[item.marketplace_id] = (
+            summary.by_marketplace.get(item.marketplace_id, 0) + 1
+        )
+    if item.category is None:
+        summary.line_items_unmapped += 1
+        return
+    summary.line_items_mapped += 1
+    summary.rows_inserted_by_group += 1
+    summary.by_category[item.category.value] = (
+        summary.by_category.get(item.category.value, 0) + 1
+    )
+    session.add(
+        FinancialEvent(
+            event_type=item.event_type,
+            posted_date=item.posted_date,
+            marketplace_id=item.marketplace_id,
+            order_id=item.order_id,
+            asin=item.asin,
+            sku=item.sku,
+            fee_type=item.fee_type,
+            category=item.category.value,
+            fee_amount=item.fee_amount,
+            raw_amount=item.raw_amount,
+            quantity=item.quantity,
+            currency=item.currency,
+            source=SOURCE_BY_GROUP,
+            raw_payload=item.raw_payload,
+        )
+    )
+
+
 __all__ = [
     "ALL_MARKETPLACES",
     "AmazonEtlSummary",
+    "ByGroupReconciliationSummary",
     "FlatLineItem",
     "MARKETPLACE_CHANNEL",
     "MARKETPLACE_CURRENCY",
+    "SOURCE_BY_DATE",
+    "SOURCE_BY_GROUP",
+    "SOURCE_SETTLEMENT",
     "flatten_events_payload",
+    "run_amazon_by_group_reconciliation",
     "run_amazon_etl",
 ]
