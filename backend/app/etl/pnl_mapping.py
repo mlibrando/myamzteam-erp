@@ -207,9 +207,21 @@ def lookup_refund_context_override(key: str) -> PnlCategory | None:
     return REFUND_CONTEXT_OVERRIDES_NORMALIZED.get(_normalize_key(key))
 
 # Per-event-list fallback when an event has no explicit line items but does
-# carry a top-level amount (rare). For ProductAdsPaymentEventList we map to
-# AD_SPEND for traceability but pnl_calculator excludes AD_SPEND from
-# daily_pnl aggregation (PR 4 owns ad_spend via the dedicated Ads ETL).
+# carry a top-level amount (rare).
+#
+# ProductAdsPaymentEventList is mapped to AD_SPEND *only for traceability* —
+# the daily_pnl ad_spend total comes from the ad_spend table (populated by
+# amazon_ads_etl), NOT from these SP-API events. pnl_calculator's
+# `_AGG_CATEGORIES` deliberately excludes AD_SPEND, so financial_events rows
+# with category=='ad_spend' are stored but never rolled into daily_pnl,
+# preventing a double-count against the authoritative Ads Reports API total.
+# The empirical gap (Jan 2026 US: SP-API ProductAdsPaymentEventList charges
+# were ~$24k higher via by-group vs by-date and both differ from the Ads API
+# total) is expected — Ads API is authoritative for spend.
+#
+# If you ever need to add another entry here that IS meant to flow into
+# daily_pnl, add its PnlCategory to `_AGG_CATEGORIES` in pnl_calculator
+# too, or the total will be silently dropped.
 EVENT_LIST_DEFAULT_CATEGORY: dict[str, PnlCategory] = {
     "ProductAdsPaymentEventList": PnlCategory.AD_SPEND,
 }

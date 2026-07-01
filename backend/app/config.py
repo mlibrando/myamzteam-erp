@@ -45,6 +45,15 @@ class Settings(BaseSettings):
 
     ETL_SCHEDULE_ENABLED: bool = True
 
+    # All monthly P&L cutoffs use this timezone. Amazon Seller Central
+    # defaults reporting cutoffs to Pacific Time regardless of the seller's
+    # marketplace region, and Elena's manual P&L follows that convention.
+    # Daily bucketing in pnl_calculator groups events by (posted_date AT
+    # TIME ZONE THIS) so daily_pnl.date matches what Elena sees in her
+    # spreadsheet. Change per-marketplace only if a future seller onboards
+    # with a different reporting timezone.
+    MONTHLY_CUTOFF_TIMEZONE: str = "America/Los_Angeles"
+
     CORS_ORIGINS: str = "http://localhost:3000"
 
     @property

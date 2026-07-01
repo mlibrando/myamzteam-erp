@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 
 from sqlalchemy import and_, func, select
@@ -25,6 +25,7 @@ from sqlalchemy import and_, func, select
 from app.database import AsyncSessionLocal
 from app.etl.amazon_etl import run_amazon_etl
 from app.etl.pnl_calculator import calculate_daily_pnl
+from app.etl.timezone_utils import date_range_utc, local_date_expr
 from app.models import DailyPnL, FinancialEvent, UnmappedLineItem
 
 logging.basicConfig(
@@ -35,8 +36,21 @@ logger = logging.getLogger(__name__)
 
 US_MARKETPLACE_ID = "ATVPDKIKX0DER"
 US_CHANNEL = "amazon_us"
-START = date(2025, 1, 1)
-END = date(2025, 1, 31)
+
+# PT-local Jan 2026. Elena's manual P&L cuts on Pacific Time (Amazon Seller
+# Central default), so validation windows are PT-anchored. daily_pnl.date is
+# also PT-local via pnl_calculator's PT bucketing, so START/END are the
+# right filters for the "did January match" question.
+START = date(2026, 1, 1)
+END = date(2026, 1, 31)
+
+# The ETL still fetches by UTC PostedAfter/PostedBefore. Widen by one day
+# on each side so we capture events posted during the ~8-hour PT-vs-UTC
+# offset at the month boundaries (they'll be bucketed to the correct PT
+# date by pnl_calculator).
+_PT_UTC_START, _PT_UTC_END = date_range_utc(START, END + timedelta(days=1))
+ETL_START = _PT_UTC_START.date()  # date used by run_amazon_etl (UTC-inclusive)
+ETL_END = _PT_UTC_END.date()      # date used by run_amazon_etl (UTC-inclusive)
 
 
 def fmt(amount: Decimal | None) -> str:
@@ -71,8 +85,8 @@ async def main() -> int:
     async with AsyncSessionLocal() as session:
         etl_summary = await run_amazon_etl(
             session,
-            start_date=START,
-            end_date=END,
+            start_date=ETL_START,
+            end_date=ETL_END,
             marketplace_ids=[US_MARKETPLACE_ID],
         )
         pnl_summary = await calculate_daily_pnl(
@@ -96,8 +110,8 @@ async def main() -> int:
     async with AsyncSessionLocal() as session:
         etl_summary_2 = await run_amazon_etl(
             session,
-            start_date=START,
-            end_date=END,
+            start_date=ETL_START,
+            end_date=ETL_END,
             marketplace_ids=[US_MARKETPLACE_ID],
         )
         pnl_summary_2 = await calculate_daily_pnl(
@@ -108,11 +122,13 @@ async def main() -> int:
         )
         await session.commit()
         # Verify financial_events row count is the same after re-run.
+        # PT-local dates so this matches Elena's window definition.
+        fe_local_date = local_date_expr(FinancialEvent.posted_date)
         count_stmt = select(func.count(FinancialEvent.id)).where(
             and_(
                 FinancialEvent.marketplace_id == US_MARKETPLACE_ID,
-                func.date(FinancialEvent.posted_date) >= START,
-                func.date(FinancialEvent.posted_date) <= END,
+                fe_local_date >= START,
+                fe_local_date <= END,
             )
         )
         fe_count = (await session.execute(count_stmt)).scalar_one()
@@ -186,8 +202,8 @@ async def main() -> int:
             .where(
                 and_(
                     UnmappedLineItem.marketplace_id == US_MARKETPLACE_ID,
-                    func.date(UnmappedLineItem.posted_date) >= START,
-                    func.date(UnmappedLineItem.posted_date) <= END,
+                    local_date_expr(UnmappedLineItem.posted_date) >= START,
+                    local_date_expr(UnmappedLineItem.posted_date) <= END,
                 )
             )
             .group_by(UnmappedLineItem.event_type, UnmappedLineItem.line_item_name)
