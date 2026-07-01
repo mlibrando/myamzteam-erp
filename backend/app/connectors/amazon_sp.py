@@ -333,3 +333,76 @@ class AmazonSPConnector(BaseConnector):
             if not next_token:
                 break
         return merged
+
+    # ---- Reports API (Settlement report ingestion) ---------------------------
+
+    async def list_reports(
+        self,
+        *,
+        report_types: list[str],
+        marketplace_ids: list[str],
+        created_since: str,
+        created_until: str,
+        processing_statuses: list[str] | None = None,
+        page_size: int = 100,
+    ) -> list[dict[str, Any]]:
+        """GET /reports/2021-06-30/reports, paginated to exhaustion.
+
+        Returns every matching report metadata dict (reportId, reportType,
+        reportDocumentId, dataStartTime, dataEndTime, processingStatus, ...).
+        Amazon auto-schedules settlement reports one per settlement group,
+        so a monthly ingestion just lists reports of type
+        GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2 in the target window."""
+        params: dict[str, Any] = {
+            "reportTypes": ",".join(report_types),
+            "marketplaceIds": ",".join(marketplace_ids),
+            "createdSince": created_since,
+            "createdUntil": created_until,
+            "pageSize": page_size,
+        }
+        if processing_statuses:
+            params["processingStatuses"] = ",".join(processing_statuses)
+
+        reports: list[dict[str, Any]] = []
+        next_token: str | None = None
+        while True:
+            call_params = dict(params) if next_token is None else {"nextToken": next_token}
+            response = await self.request(
+                "GET",
+                "/reports/2021-06-30/reports",
+                endpoint_key=f"reports:{self.region}",
+                rate_limit=REPORTS_RATE,
+                params=call_params,
+            )
+            body = response.json()
+            reports.extend(body.get("reports", []))
+            next_token = body.get("nextToken")
+            if not next_token:
+                break
+        return reports
+
+    async def get_report_document(self, report_document_id: str) -> dict[str, Any]:
+        """GET /reports/2021-06-30/documents/{reportDocumentId}.
+
+        Returns { reportDocumentId, url, compressionAlgorithm? } — the URL
+        is a pre-signed S3 link that expires quickly. Settlement reports
+        are NOT encrypted (unlike some older SP-API reports), so no
+        decryption step is needed."""
+        response = await self.request(
+            "GET",
+            f"/reports/2021-06-30/documents/{report_document_id}",
+            endpoint_key=f"reports:{self.region}",
+            rate_limit=REPORTS_RATE,
+        )
+        return response.json()
+
+    async def download_report_document(
+        self,
+        report_document: dict[str, Any],
+    ) -> bytes:
+        """Fetch the raw document bytes from the pre-signed URL. The caller
+        handles decompression (compressionAlgorithm=GZIP) and TSV parsing."""
+        url = report_document["url"]
+        response = await self._client.get(url)
+        response.raise_for_status()
+        return response.content

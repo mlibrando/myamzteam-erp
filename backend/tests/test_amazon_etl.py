@@ -102,6 +102,16 @@ def test_pnl_mapping_md_confirmed_items_are_mapped():
     assert SERVICE_FEE_TYPE["RetrochargeReversal"] is PnlCategory.OPERATIONAL_FEES
     assert SERVICE_FEE_TYPE["FeeAdjustment"] is PnlCategory.OPERATIONAL_FEES
     assert SERVICE_FEE_TYPE["OtherTransaction"] is PnlCategory.OPERATIONAL_FEES
+    # Op Fees from the Elena/Sellerise crosswalk (2026-07-01 diff)
+    assert SERVICE_FEE_TYPE["FBALongTermStorageFee"] is PnlCategory.OPERATIONAL_FEES
+    assert SERVICE_FEE_TYPE["FBAInboundConvenienceFee"] is PnlCategory.OPERATIONAL_FEES
+    assert SERVICE_FEE_TYPE["FBARemovalFee"] is PnlCategory.OPERATIONAL_FEES
+    assert SERVICE_FEE_TYPE["FBADisposalFee"] is PnlCategory.OPERATIONAL_FEES
+    assert SERVICE_FEE_TYPE["PaidServicesFee"] is PnlCategory.OPERATIONAL_FEES
+    assert SERVICE_FEE_TYPE["CouponPerformanceFee"] is PnlCategory.OPERATIONAL_FEES
+    assert SERVICE_FEE_TYPE["CouponParticipationFee"] is PnlCategory.OPERATIONAL_FEES
+    # Reversal reimbursement lives in Op Fees per Elena's Sellerise formula
+    assert ADJUSTMENT_TYPE["ReversalReimbursement"] is PnlCategory.OPERATIONAL_FEES
     # Refunds addition
     assert ADJUSTMENT_TYPE["Goodwill"] is PnlCategory.REFUNDS
     # Reimbursements addition
@@ -311,7 +321,47 @@ def test_flatten_service_fee_event_maps_storage_to_operational():
     assert items[0].fee_amount == Decimal("25.00")
 
 
-def test_flatten_adjustment_reimbursement():
+def test_service_fee_types_from_elena_crosswalk_all_map_to_op_fees():
+    """After the 2026-07-01 line-item diff against Elena's Sellerise sheet,
+    the following SP-API fee_type strings all belong to Op Fees. Prior to
+    this fix they were landing in unmapped_line_items and dropping ~$5.6k
+    of Jan 2026 US Op Fees on the floor."""
+    for fee_type in (
+        "FBALongTermStorageFee",     # Elena: Storage renewal billing
+        "FBAInboundConvenienceFee",  # Elena: FBA inbound placement service fee
+        "FBARemovalFee",             # Elena: Removal complete
+        "FBADisposalFee",            # Elena: Disposal complete
+        "PaidServicesFee",           # Elena: Premium services fee
+        "CouponPerformanceFee",      # Elena: Amazon fees (aggregate)
+        "CouponParticipationFee",    # Elena: Amazon fees (aggregate)
+        "CustomerReturnHRRUnitFee",  # Not in Elena's list, still Op Fee
+    ):
+        fixture = {
+            "PostedDate": "2026-01-15T10:00:00Z",
+            "FeeList": [
+                {"FeeType": fee_type, "FeeAmount": _amt(-10.00)},
+            ],
+        }
+        items = list(
+            flatten_events_payload(
+                _build_payload(ServiceFeeEventList=[fixture]),
+                region="NA",
+            )
+        )
+        assert len(items) == 1, f"{fee_type} produced no line item"
+        assert items[0].category is PnlCategory.OPERATIONAL_FEES, (
+            f"{fee_type} mapped to {items[0].category} not OPERATIONAL_FEES"
+        )
+        assert items[0].fee_type == fee_type
+        assert items[0].fee_amount == Decimal("10.00")  # cost cat inverts sign
+
+
+def test_flatten_adjustment_reversal_reimbursement_is_op_fee_offset():
+    """Elena's Sellerise formula puts ReversalReimbursement inside Op Fees
+    as a negative-expense offset (Amazon reversing a prior fee). Raw is
+    positive (cash coming back); fee_amount is negative because
+    normalize_amount inverts for cost categories — subtracting a negative
+    fee from the P&L formula reduces total Op Fees, matching Elena."""
     items = list(
         flatten_events_payload(
             _build_payload(AdjustmentEventList=[ADJUSTMENT_REIMBURSEMENT_FIXTURE]),
@@ -319,9 +369,9 @@ def test_flatten_adjustment_reimbursement():
         )
     )
     assert len(items) == 1
-    assert items[0].category is PnlCategory.REIMBURSEMENTS
+    assert items[0].category is PnlCategory.OPERATIONAL_FEES
     assert items[0].raw_amount == Decimal("12.50")
-    assert items[0].fee_amount == Decimal("12.50")  # inflow passes through
+    assert items[0].fee_amount == Decimal("-12.50")  # cost cat inverts sign
     assert items[0].sku == "MBDBOX1"
     assert items[0].quantity == 1
 
@@ -428,12 +478,21 @@ def test_region_resolution_picks_correct_primary():
 
 
 def test_all_seven_categories_appear_in_a_combined_payload():
+    # Elena's Sellerise formula now puts ReversalReimbursement in Op Fees, so
+    # we need a different AdjustmentType to exercise the REIMBURSEMENTS bucket
+    # here — MissingFromInbound stays in Reimbursements.
+    missing_from_inbound_fixture = {
+        "PostedDate": "2025-01-19T00:00:00Z",
+        "AdjustmentType": "MissingFromInbound",
+        "AdjustmentAmount": _amt(50.00),
+    }
     payload = _build_payload(
         ShipmentEventList=[SHIPMENT_FIXTURE],  # SALES + SELLING_FEES
         RefundEventList=[REFUND_FIXTURE],  # REFUNDS
         ServiceFeeEventList=[SERVICE_FEE_FIXTURE],  # OPERATIONAL_FEES
         AdjustmentEventList=[
-            ADJUSTMENT_REIMBURSEMENT_FIXTURE,  # REIMBURSEMENTS
+            missing_from_inbound_fixture,  # REIMBURSEMENTS
+            ADJUSTMENT_REIMBURSEMENT_FIXTURE,  # OPERATIONAL_FEES (per Elena)
             ADJUSTMENT_LIQUIDATION_FIXTURE,  # SALES (via liquidations)
         ],
         ProductAdsPaymentEventList=[PRODUCT_ADS_PAYMENT_FIXTURE],  # AD_SPEND
@@ -539,7 +598,7 @@ def test_adjustment_event_without_posted_date_uses_fallback_and_currency():
     )
     assert items[0].posted_date == window_start
     assert items[0].marketplace_id == "ATVPDKIKX0DER"
-    assert items[0].category is PnlCategory.REIMBURSEMENTS
+    assert items[0].category is PnlCategory.OPERATIONAL_FEES
 
 
 def test_explicit_posted_date_overrides_fallback():
@@ -568,7 +627,7 @@ def test_screaming_snake_case_adjustment_types_resolve_to_camelcase_categories()
     SCREAMING_SNAKE_CASE ('REVERSAL_REIMBURSEMENT') for the same identifier
     in different endpoints. Both forms must resolve to the same category."""
     fixtures = [
-        ("REVERSAL_REIMBURSEMENT", PnlCategory.REIMBURSEMENTS),
+        ("REVERSAL_REIMBURSEMENT", PnlCategory.OPERATIONAL_FEES),
         ("COMPENSATED_CLAWBACK", PnlCategory.OPERATIONAL_FEES),
         ("WAREHOUSE_LOST", PnlCategory.REIMBURSEMENTS),
         ("WAREHOUSE_DAMAGE", PnlCategory.REIMBURSEMENTS),

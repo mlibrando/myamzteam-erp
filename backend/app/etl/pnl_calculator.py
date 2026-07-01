@@ -28,7 +28,7 @@ from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Iterable
 
-from sqlalchemy import and_, cast, func, select, Date
+from sqlalchemy import and_, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -38,6 +38,7 @@ from app.connectors.amazon_sp import (
     MARKETPLACE_REGION,
 )
 from app.etl.pnl_mapping import PnlCategory
+from app.etl.timezone_utils import local_date_expr
 from app.models import AdSpend, CurrencyRate, DailyPnL, FinancialEvent, ProductCogs
 
 
@@ -107,8 +108,13 @@ async def _aggregate_categories(
     end_date: date,
     marketplace_ids: Iterable[str],
 ) -> dict[tuple[date, str], dict[str, Decimal]]:
-    """Sum fee_amount per (date, marketplace_id, category) across the window."""
-    date_col = cast(FinancialEvent.posted_date, Date).label("posted_day")
+    """Sum fee_amount per (local_date, marketplace_id, category) across the window.
+
+    Dates are bucketed in settings.MONTHLY_CUTOFF_TIMEZONE (default PT) so
+    daily_pnl.date matches Elena's Seller Central defaults. start_date /
+    end_date are interpreted as local dates in the same zone.
+    """
+    date_col = local_date_expr(FinancialEvent.posted_date).label("posted_day")
     stmt = (
         select(
             date_col,
@@ -119,8 +125,8 @@ async def _aggregate_categories(
         .where(
             and_(
                 FinancialEvent.marketplace_id.in_(list(marketplace_ids)),
-                cast(FinancialEvent.posted_date, Date) >= start_date,
-                cast(FinancialEvent.posted_date, Date) <= end_date,
+                date_col >= start_date,
+                date_col <= end_date,
                 FinancialEvent.category.is_not(None),
             )
         )
@@ -143,14 +149,15 @@ async def _aggregate_net_units(
     end_date: date,
     marketplace_ids: Iterable[str],
 ) -> dict[tuple[date, str, str], int]:
-    """Net units sold per (date, marketplace, sku).
+    """Net units sold per (local_date, marketplace, sku).
 
     Counts quantity ONCE per shipment item via the Principal-charge row,
     then subtracts the Principal-charge quantity from refund events.
     Other fee_type rows for the same shipment item duplicate quantity, so
-    we filter to Principal-only.
+    we filter to Principal-only. Dates use the cutoff-tz bucket so units
+    line up with category totals in daily_pnl.
     """
-    date_col = cast(FinancialEvent.posted_date, Date).label("posted_day")
+    date_col = local_date_expr(FinancialEvent.posted_date).label("posted_day")
     stmt = (
         select(
             date_col,
@@ -162,8 +169,8 @@ async def _aggregate_net_units(
         .where(
             and_(
                 FinancialEvent.marketplace_id.in_(list(marketplace_ids)),
-                cast(FinancialEvent.posted_date, Date) >= start_date,
-                cast(FinancialEvent.posted_date, Date) <= end_date,
+                date_col >= start_date,
+                date_col <= end_date,
                 FinancialEvent.fee_type == "Principal",
                 FinancialEvent.sku.is_not(None),
                 FinancialEvent.event_type.in_(["ShipmentEvent", "RefundEvent"]),

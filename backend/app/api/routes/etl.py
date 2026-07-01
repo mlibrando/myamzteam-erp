@@ -14,7 +14,12 @@ from app.etl.amazon_ads_etl import (
     ALL_MARKETPLACES as ADS_ALL_MARKETPLACES,
     run_amazon_ads_etl,
 )
-from app.etl.amazon_etl import ALL_MARKETPLACES, run_amazon_etl
+from app.etl.amazon_etl import (
+    ALL_MARKETPLACES,
+    run_amazon_by_group_reconciliation,
+    run_amazon_etl,
+)
+from app.etl.amazon_settlement_etl import run_amazon_settlement_ingestion
 from app.etl.pnl_calculator import calculate_daily_pnl
 
 logger = logging.getLogger(__name__)
@@ -97,6 +102,143 @@ async def run_amazon(
 
     await db.commit()
     return AmazonEtlResponse(etl=etl_summary.to_dict(), pnl=pnl_summary)
+
+
+class AmazonByGroupReconciliationRequest(BaseModel):
+    """PT-local date window. The reconciliation ETL translates to UTC
+    internally to fetch settlement-group events."""
+
+    window_start_pt: date
+    window_end_pt: date
+    marketplace_ids: list[str] | None = Field(
+        default=None,
+        description="If omitted, runs for all five marketplaces.",
+    )
+    skip_pnl_calc: bool = False
+
+    @field_validator("window_end_pt")
+    @classmethod
+    def _end_after_start(cls, v: date, info: Any) -> date:
+        start = info.data.get("window_start_pt")
+        if start and v < start:
+            raise ValueError("window_end_pt must be >= window_start_pt")
+        return v
+
+    @field_validator("marketplace_ids")
+    @classmethod
+    def _validate_marketplaces(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return v
+        unknown = [m for m in v if m not in MARKETPLACE_REGION]
+        if unknown:
+            raise ValueError(f"unknown marketplace_ids: {unknown}")
+        return v
+
+
+@router.post(
+    "/etl/amazon/reconcile-by-group",
+    response_model=AmazonEtlResponse,
+)
+async def reconcile_by_group(
+    request: AmazonByGroupReconciliationRequest,
+    db: AsyncSession = Depends(get_db),
+) -> AmazonEtlResponse:
+    """Replace by-date financial_events with by-group data for the given
+    PT-local window. This is the monthly reconciliation pass that closes
+    the ~$4.4k Op Fees gap the daily ETL misses (storage / long-term-storage
+    / inbound-convenience / removal / inbound-transportation / subscription
+    fees that only settle after the group Closes). Safe to run repeatedly."""
+    marketplaces = request.marketplace_ids or list(ALL_MARKETPLACES)
+    logger.info(
+        "by_group_reconciliation_route start_pt=%s end_pt=%s marketplaces=%s",
+        request.window_start_pt,
+        request.window_end_pt,
+        marketplaces,
+    )
+    try:
+        recon_summary = await run_amazon_by_group_reconciliation(
+            db,
+            window_start_pt=request.window_start_pt,
+            window_end_pt=request.window_end_pt,
+            marketplace_ids=marketplaces,
+        )
+    except Exception as exc:
+        await db.rollback()
+        logger.exception("by_group_reconciliation_route failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"by-group reconciliation failed: {exc}",
+        ) from exc
+
+    pnl_summary: dict[str, Any] = {"skipped": True}
+    if not request.skip_pnl_calc:
+        pnl_calc = await calculate_daily_pnl(
+            db,
+            start_date=request.window_start_pt,
+            end_date=request.window_end_pt,
+            marketplace_ids=marketplaces,
+        )
+        pnl_summary = {
+            "rows_written": pnl_calc.rows_written,
+            "skus_without_cogs": pnl_calc.skus_without_cogs,
+        }
+
+    await db.commit()
+    return AmazonEtlResponse(etl=recon_summary.to_dict(), pnl=pnl_summary)
+
+
+@router.post(
+    "/etl/amazon/ingest-settlement-taxes",
+    response_model=AmazonEtlResponse,
+)
+async def ingest_settlement_taxes(
+    request: AmazonByGroupReconciliationRequest,
+    db: AsyncSession = Depends(get_db),
+) -> AmazonEtlResponse:
+    """Ingest Taxes-remitted-to-Amazon lines from settlement reports for
+    the given PT-local window. Only rows whose amount-description matches
+    MarketplaceFacilitatorTax*, MarketplaceFacilitatorVAT*, or TaxWithheld
+    are inserted (source='settlement', category='selling_fees'). Every
+    other row in the settlement report is skipped since it's already
+    captured by the daily by-date ETL or the monthly by-group
+    reconciliation. Safe to run repeatedly."""
+    marketplaces = request.marketplace_ids or list(ALL_MARKETPLACES)
+    logger.info(
+        "settlement_ingestion_route start_pt=%s end_pt=%s marketplaces=%s",
+        request.window_start_pt,
+        request.window_end_pt,
+        marketplaces,
+    )
+    try:
+        recon_summary = await run_amazon_settlement_ingestion(
+            db,
+            window_start_pt=request.window_start_pt,
+            window_end_pt=request.window_end_pt,
+            marketplace_ids=marketplaces,
+        )
+    except Exception as exc:
+        await db.rollback()
+        logger.exception("settlement_ingestion_route failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"settlement ingestion failed: {exc}",
+        ) from exc
+
+    pnl_summary: dict[str, Any] = {"skipped": True}
+    if not request.skip_pnl_calc:
+        pnl_calc = await calculate_daily_pnl(
+            db,
+            start_date=request.window_start_pt,
+            end_date=request.window_end_pt,
+            marketplace_ids=marketplaces,
+        )
+        pnl_summary = {
+            "rows_written": pnl_calc.rows_written,
+            "skus_without_cogs": pnl_calc.skus_without_cogs,
+        }
+
+    await db.commit()
+    return AmazonEtlResponse(etl=recon_summary.to_dict(), pnl=pnl_summary)
 
 
 class AmazonAdsEtlRequest(BaseModel):

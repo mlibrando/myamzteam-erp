@@ -88,15 +88,37 @@ SHIPMENT_ITEM_FEE_TYPE: dict[str, PnlCategory] = {
 # ServiceFeeEvent.FeeList[].FeeType and ServiceFeeEvent.FeeReason
 # (Many ServiceFeeEvents have a single-element FeeList where FeeType==FeeReason;
 # this table covers both lookups.)
+#
+# SP-API and Sellerise use different vocabulary for the same Amazon-side fee.
+# Elena's spreadsheet uses Sellerise labels; we consolidate both into
+# PnlCategory buckets so the aggregate matches her formula. Confirmed by
+# line-item diff against Elena's Jan 2026 US RAW_AMZ_US sheet (2026-07-01):
+#   SP-API label                    | Elena's Sellerise label
+#   FBALongTermStorageFee           -> Storage renewal billing
+#   FBAInboundConvenienceFee        -> FBA inbound placement service fee
+#   FBARemovalFee                   -> Removal complete
+#   FBADisposalFee                  -> Disposal complete
+#   PaidServicesFee                 -> Premium services fee
+#   CouponPerformanceFee +          -> Amazon fees (Elena aggregates the two
+#     CouponParticipationFee           coupon fees under one label)
+#   CustomerReturnHRRUnitFee        -> (not in Elena's list, tiny amount)
 SERVICE_FEE_TYPE: dict[str, PnlCategory] = {
     # PNL_MAPPING.md Operational Fees
     "FBAStorageFee": PnlCategory.OPERATIONAL_FEES,
+    "FBALongTermStorageFee": PnlCategory.OPERATIONAL_FEES,
     "StorageRenewalBilling": PnlCategory.OPERATIONAL_FEES,
     "FBAInboundTransportationFee": PnlCategory.OPERATIONAL_FEES,
     "FBAInboundTransportationFeeAdjustment": PnlCategory.OPERATIONAL_FEES,
     "FBAInboundPlacementServiceFee": PnlCategory.OPERATIONAL_FEES,
+    "FBAInboundConvenienceFee": PnlCategory.OPERATIONAL_FEES,
+    "FBARemovalFee": PnlCategory.OPERATIONAL_FEES,
+    "FBADisposalFee": PnlCategory.OPERATIONAL_FEES,
     "Subscription": PnlCategory.OPERATIONAL_FEES,
     "PremiumServiceFee": PnlCategory.OPERATIONAL_FEES,
+    "PaidServicesFee": PnlCategory.OPERATIONAL_FEES,
+    "CouponPerformanceFee": PnlCategory.OPERATIONAL_FEES,
+    "CouponParticipationFee": PnlCategory.OPERATIONAL_FEES,
+    "CustomerReturnHRRUnitFee": PnlCategory.OPERATIONAL_FEES,
     "DisposalComplete": PnlCategory.OPERATIONAL_FEES,
     "RemovalComplete": PnlCategory.OPERATIONAL_FEES,
     "FreeReplacementRefundItems": PnlCategory.OPERATIONAL_FEES,
@@ -116,9 +138,17 @@ SERVICE_FEE_TYPE: dict[str, PnlCategory] = {
 }
 
 # AdjustmentEvent.AdjustmentType
+#
+# Elena's Sellerise column layout puts "Reversal reimbursement" inside the
+# Op Fees formula, not Reimbursements — a reversal of an earlier
+# Amazon-side fee (e.g. Amazon reimburses a mistakenly-charged fee) is
+# treated as a negative expense that partially offsets Op Fees. Confirmed
+# 2026-07-01 against Elena's Jan 2026 US RAW_AMZ_US sheet. Semantically
+# reasonable — the money doesn't come from customer refunds or lost
+# inventory; it comes from Amazon reversing an operational fee.
 ADJUSTMENT_TYPE: dict[str, PnlCategory] = {
     # PNL_MAPPING.md Reimbursements from AMZ
-    "ReversalReimbursement": PnlCategory.REIMBURSEMENTS,
+    "ReversalReimbursement": PnlCategory.OPERATIONAL_FEES,
     "MissingFromInbound": PnlCategory.REIMBURSEMENTS,
     "WarehouseDamage": PnlCategory.REIMBURSEMENTS,
     "WarehouseLost": PnlCategory.REIMBURSEMENTS,
@@ -207,9 +237,21 @@ def lookup_refund_context_override(key: str) -> PnlCategory | None:
     return REFUND_CONTEXT_OVERRIDES_NORMALIZED.get(_normalize_key(key))
 
 # Per-event-list fallback when an event has no explicit line items but does
-# carry a top-level amount (rare). For ProductAdsPaymentEventList we map to
-# AD_SPEND for traceability but pnl_calculator excludes AD_SPEND from
-# daily_pnl aggregation (PR 4 owns ad_spend via the dedicated Ads ETL).
+# carry a top-level amount (rare).
+#
+# ProductAdsPaymentEventList is mapped to AD_SPEND *only for traceability* —
+# the daily_pnl ad_spend total comes from the ad_spend table (populated by
+# amazon_ads_etl), NOT from these SP-API events. pnl_calculator's
+# `_AGG_CATEGORIES` deliberately excludes AD_SPEND, so financial_events rows
+# with category=='ad_spend' are stored but never rolled into daily_pnl,
+# preventing a double-count against the authoritative Ads Reports API total.
+# The empirical gap (Jan 2026 US: SP-API ProductAdsPaymentEventList charges
+# were ~$24k higher via by-group vs by-date and both differ from the Ads API
+# total) is expected — Ads API is authoritative for spend.
+#
+# If you ever need to add another entry here that IS meant to flow into
+# daily_pnl, add its PnlCategory to `_AGG_CATEGORIES` in pnl_calculator
+# too, or the total will be silently dropped.
 EVENT_LIST_DEFAULT_CATEGORY: dict[str, PnlCategory] = {
     "ProductAdsPaymentEventList": PnlCategory.AD_SPEND,
 }
