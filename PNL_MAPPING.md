@@ -66,6 +66,24 @@ items confirmed by the client's data specialist (2026-06).
 - Free replacement refund items
 - Fee adjustment
 - Other-transaction
+- **Reversal reimbursement** (Elena's Sellerise-derived formula treats this as a negative-expense offset inside Op Fees, not as a separate Reimbursements line. Confirmed 2026-07-01 against her Jan 2026 US sheet — moving it here matched her Op Fees total exactly.)
+
+### SP-API vocabulary crosswalk (confirmed 2026-07-01 against Elena's RAW_AMZ_US)
+
+Elena's column labels come from Sellerise; SP-API returns different `fee_type` strings for the same underlying Amazon-side fee. Both names map to Operational Fees:
+
+| Elena's label | SP-API `fee_type` | Notes |
+|---|---|---|
+| Storage fees | `FBAStorageFee` | Monthly inventory storage |
+| Storage renewal billing | `FBALongTermStorageFee` (+ `StorageRenewalBilling` as alternate) | Long-term storage surcharge |
+| FBA inbound placement service fee | `FBAInboundConvenienceFee` (+ `FBAInboundPlacementServiceFee` as alternate) | Inbound processing at Amazon warehouse |
+| Removal complete | `FBARemovalFee` (+ `RemovalComplete` as adjustment-side alternate) | Per-unit fee for removing inventory |
+| Disposal complete | `FBADisposalFee` (+ `DisposalComplete` as adjustment-side alternate) | Per-unit fee for disposing inventory |
+| Premium services fee | `PaidServicesFee` (+ `PremiumServiceFee` as alternate) | Amazon Global Selling / Vendor Central paid services |
+| Amazon fees | `CouponPerformanceFee` + `CouponParticipationFee` | Elena aggregates the two coupon-related fees into a single "Amazon fees" line |
+| Inbound transportation fee | `FBAInboundTransportationFee` (`FeeReason=INITIAL_FEE`) | Amazon-arranged inbound freight |
+| Inbound transportation fee - adjustment | `FBAInboundTransportationFee` (`FeeReason=SELLER_CAUSED_OMC`) | Post-hoc correction; same SP-API `fee_type`, different `FeeReason` — currently summed together with the initial fee in our aggregation |
+| Reversal reimbursement | `AdjustmentEvent.AdjustmentType=REVERSAL_REIMBURSEMENT` | See note above; moved to Op Fees per Elena's formula |
 
 ## Refunds
 - Refund - Product sales
@@ -79,11 +97,12 @@ items confirmed by the client's data specialist (2026-06).
 - Goodwill
 
 ## Reimbursements from AMZ (separate positive line item)
-- Reversal reimbursement
 - Missing from inbound
 - Warehouse damage
 - Warehouse lost
 - Removal order lost
+
+(**Reversal reimbursement is NOT in this list** — Elena's Sellerise formula categorizes it under Op Fees as a negative-expense offset. See "Operational Fees" above.)
 
 ## P&L Formula
 Gross Profit (without reimbursements) = Sales - COGS - Ad Spend - Selling Fees - Operational Fees - Refunds

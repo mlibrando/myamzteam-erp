@@ -88,15 +88,37 @@ SHIPMENT_ITEM_FEE_TYPE: dict[str, PnlCategory] = {
 # ServiceFeeEvent.FeeList[].FeeType and ServiceFeeEvent.FeeReason
 # (Many ServiceFeeEvents have a single-element FeeList where FeeType==FeeReason;
 # this table covers both lookups.)
+#
+# SP-API and Sellerise use different vocabulary for the same Amazon-side fee.
+# Elena's spreadsheet uses Sellerise labels; we consolidate both into
+# PnlCategory buckets so the aggregate matches her formula. Confirmed by
+# line-item diff against Elena's Jan 2026 US RAW_AMZ_US sheet (2026-07-01):
+#   SP-API label                    | Elena's Sellerise label
+#   FBALongTermStorageFee           -> Storage renewal billing
+#   FBAInboundConvenienceFee        -> FBA inbound placement service fee
+#   FBARemovalFee                   -> Removal complete
+#   FBADisposalFee                  -> Disposal complete
+#   PaidServicesFee                 -> Premium services fee
+#   CouponPerformanceFee +          -> Amazon fees (Elena aggregates the two
+#     CouponParticipationFee           coupon fees under one label)
+#   CustomerReturnHRRUnitFee        -> (not in Elena's list, tiny amount)
 SERVICE_FEE_TYPE: dict[str, PnlCategory] = {
     # PNL_MAPPING.md Operational Fees
     "FBAStorageFee": PnlCategory.OPERATIONAL_FEES,
+    "FBALongTermStorageFee": PnlCategory.OPERATIONAL_FEES,
     "StorageRenewalBilling": PnlCategory.OPERATIONAL_FEES,
     "FBAInboundTransportationFee": PnlCategory.OPERATIONAL_FEES,
     "FBAInboundTransportationFeeAdjustment": PnlCategory.OPERATIONAL_FEES,
     "FBAInboundPlacementServiceFee": PnlCategory.OPERATIONAL_FEES,
+    "FBAInboundConvenienceFee": PnlCategory.OPERATIONAL_FEES,
+    "FBARemovalFee": PnlCategory.OPERATIONAL_FEES,
+    "FBADisposalFee": PnlCategory.OPERATIONAL_FEES,
     "Subscription": PnlCategory.OPERATIONAL_FEES,
     "PremiumServiceFee": PnlCategory.OPERATIONAL_FEES,
+    "PaidServicesFee": PnlCategory.OPERATIONAL_FEES,
+    "CouponPerformanceFee": PnlCategory.OPERATIONAL_FEES,
+    "CouponParticipationFee": PnlCategory.OPERATIONAL_FEES,
+    "CustomerReturnHRRUnitFee": PnlCategory.OPERATIONAL_FEES,
     "DisposalComplete": PnlCategory.OPERATIONAL_FEES,
     "RemovalComplete": PnlCategory.OPERATIONAL_FEES,
     "FreeReplacementRefundItems": PnlCategory.OPERATIONAL_FEES,
@@ -116,9 +138,17 @@ SERVICE_FEE_TYPE: dict[str, PnlCategory] = {
 }
 
 # AdjustmentEvent.AdjustmentType
+#
+# Elena's Sellerise column layout puts "Reversal reimbursement" inside the
+# Op Fees formula, not Reimbursements — a reversal of an earlier
+# Amazon-side fee (e.g. Amazon reimburses a mistakenly-charged fee) is
+# treated as a negative expense that partially offsets Op Fees. Confirmed
+# 2026-07-01 against Elena's Jan 2026 US RAW_AMZ_US sheet. Semantically
+# reasonable — the money doesn't come from customer refunds or lost
+# inventory; it comes from Amazon reversing an operational fee.
 ADJUSTMENT_TYPE: dict[str, PnlCategory] = {
     # PNL_MAPPING.md Reimbursements from AMZ
-    "ReversalReimbursement": PnlCategory.REIMBURSEMENTS,
+    "ReversalReimbursement": PnlCategory.OPERATIONAL_FEES,
     "MissingFromInbound": PnlCategory.REIMBURSEMENTS,
     "WarehouseDamage": PnlCategory.REIMBURSEMENTS,
     "WarehouseLost": PnlCategory.REIMBURSEMENTS,
