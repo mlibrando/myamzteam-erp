@@ -214,6 +214,96 @@ async def test_create_campaign_report_returns_report_id_and_uses_right_typeid():
         assert cfg["format"] == "GZIP_JSON"
 
 
+async def test_create_report_handles_425_duplicate_by_reusing_id():
+    """Amazon Ads returns 425 with {'code':'425','detail':'duplicate of : <uuid>'}
+    when an identical create request was made in the last ~24h. The connector
+    must extract that existing reportId and return it instead of failing."""
+    base = REGION_BASE_URLS["NA"]
+    existing_id = "7307043c-3eab-4f59-b981-609f42b98849"
+    with respx.mock(assert_all_called=True) as mock:
+        _token_route(mock)
+        mock.post(f"{base}/reporting/reports").mock(
+            return_value=httpx.Response(
+                425,
+                json={
+                    "code": "425",
+                    "detail": f"The Request is a duplicate of : {existing_id}",
+                },
+            )
+        )
+        async with AmazonAdsConnector(
+            region="NA", profile_id="prof", **CREDS
+        ) as conn:
+            report_id = await conn.create_campaign_report(
+                ad_product="SPONSORED_PRODUCTS",
+                start_date="2026-06-23",
+                end_date="2026-06-29",
+            )
+        assert report_id == existing_id
+
+
+async def test_create_report_handles_425_with_typed_duplicate_id_field():
+    """Some Ads responses surface the existing ID under a typed field rather
+    than embedded in the detail string. Support both shapes."""
+    base = REGION_BASE_URLS["NA"]
+    existing_id = "abc12345-dead-beef-cafe-000000000001"
+    with respx.mock(assert_all_called=True) as mock:
+        _token_route(mock)
+        mock.post(f"{base}/reporting/reports").mock(
+            return_value=httpx.Response(
+                425, json={"code": "425", "duplicateReportId": existing_id}
+            )
+        )
+        async with AmazonAdsConnector(
+            region="NA", profile_id="prof", **CREDS
+        ) as conn:
+            report_id = await conn.create_campaign_report(
+                ad_product="SPONSORED_BRANDS",
+                start_date="2026-06-23",
+                end_date="2026-06-29",
+            )
+        assert report_id == existing_id
+
+
+async def test_create_report_425_without_parseable_id_raises():
+    base = REGION_BASE_URLS["NA"]
+    with respx.mock(assert_all_called=True) as mock:
+        _token_route(mock)
+        mock.post(f"{base}/reporting/reports").mock(
+            return_value=httpx.Response(425, text="garbage no uuid here")
+        )
+        async with AmazonAdsConnector(
+            region="NA", profile_id="prof", **CREDS
+        ) as conn:
+            with pytest.raises(Exception, match="duplicate"):
+                await conn.create_campaign_report(
+                    ad_product="SPONSORED_PRODUCTS",
+                    start_date="2026-06-23",
+                    end_date="2026-06-29",
+                )
+
+
+def test_extract_duplicate_report_id_handles_variants():
+    """Parser coverage for the body shapes we've seen in the wild."""
+    from app.connectors.amazon_ads import _extract_duplicate_report_id
+
+    # Standard v3 shape
+    assert _extract_duplicate_report_id(
+        '{"code":"425","detail":"The Request is a duplicate of : 7307043c-3eab-4f59-b981-609f42b98849"}'
+    ) == "7307043c-3eab-4f59-b981-609f42b98849"
+    # Typed field variant
+    assert _extract_duplicate_report_id(
+        '{"duplicateReportId":"abc12345-dead-beef-cafe-000000000001"}'
+    ) == "abc12345-dead-beef-cafe-000000000001"
+    # Non-JSON fallback
+    assert _extract_duplicate_report_id(
+        "Plain text: duplicate of : abc12345-dead-beef-cafe-000000000002"
+    ) == "abc12345-dead-beef-cafe-000000000002"
+    # Unparseable returns None
+    assert _extract_duplicate_report_id("nope") is None
+    assert _extract_duplicate_report_id("") is None
+
+
 async def test_wait_for_report_polls_until_completed():
     base = REGION_BASE_URLS["NA"]
     with respx.mock(assert_all_called=True) as mock:

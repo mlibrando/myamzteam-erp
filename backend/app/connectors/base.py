@@ -118,7 +118,13 @@ class BaseConnector:
         json: Any | None = None,
         headers: dict[str, str] | None = None,
         auth: bool = True,
+        allowed_statuses: set[int] | None = None,
     ) -> httpx.Response:
+        """`allowed_statuses` opts the caller into seeing specific 4xx codes
+        as successful responses (no raise_for_status). Useful for endpoints
+        whose 4xx replies carry actionable data — e.g. Amazon Ads returns
+        425 with the existing reportId in the body for duplicate-create
+        requests, and the caller wants to extract that ID rather than error."""
         url = path if path.startswith("http") else f"{self.base_url}{path}"
         attempt = 0
         forced_refresh = False
@@ -186,6 +192,8 @@ class BaseConnector:
             if response.status_code == 401:
                 raise AuthError(f"{method} {url} unauthorized after refresh: {response.text}")
 
+            if allowed_statuses and response.status_code in allowed_statuses:
+                return response
             response.raise_for_status()
             return response
 

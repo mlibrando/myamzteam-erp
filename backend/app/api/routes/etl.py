@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.connectors.amazon_sp import MARKETPLACE_REGION
-from app.database import get_db
+from app.database import AsyncSessionLocal, get_db
 from app.etl.amazon_ads_etl import (
     ALL_MARKETPLACES as ADS_ALL_MARKETPLACES,
     run_amazon_ads_etl,
@@ -130,8 +130,10 @@ class AmazonAdsEtlRequest(BaseModel):
 @router.post("/etl/amazon-ads/run", response_model=AmazonEtlResponse)
 async def run_amazon_ads(
     request: AmazonAdsEtlRequest,
-    db: AsyncSession = Depends(get_db),
 ) -> AmazonEtlResponse:
+    """Runs the Ads ETL with the app-level session_maker (not a request-scoped
+    session) because report polling can take up to 10 minutes per report; a
+    single session held that long would be dropped by the Postgres proxy."""
     marketplaces = request.marketplace_ids or list(ADS_ALL_MARKETPLACES)
     logger.info(
         "ads_etl_route start=%s end=%s marketplaces=%s",
@@ -141,13 +143,12 @@ async def run_amazon_ads(
     )
     try:
         etl_summary = await run_amazon_ads_etl(
-            db,
+            AsyncSessionLocal,
             start_date=request.start_date,
             end_date=request.end_date,
             marketplace_ids=marketplaces,
         )
     except Exception as exc:
-        await db.rollback()
         logger.exception("ads_etl_route failed: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -156,16 +157,17 @@ async def run_amazon_ads(
 
     pnl_summary: dict[str, Any] = {"skipped": True}
     if not request.skip_pnl_calc:
-        pnl_calc = await calculate_daily_pnl(
-            db,
-            start_date=request.start_date,
-            end_date=request.end_date,
-            marketplace_ids=marketplaces,
-        )
+        async with AsyncSessionLocal() as session:
+            pnl_calc = await calculate_daily_pnl(
+                session,
+                start_date=request.start_date,
+                end_date=request.end_date,
+                marketplace_ids=marketplaces,
+            )
+            await session.commit()
         pnl_summary = {
             "rows_written": pnl_calc.rows_written,
             "skus_without_cogs": pnl_calc.skus_without_cogs,
         }
 
-    await db.commit()
     return AmazonEtlResponse(etl=etl_summary.to_dict(), pnl=pnl_summary)

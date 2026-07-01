@@ -23,7 +23,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from sqlalchemy import and_, delete
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.connectors.amazon_ads import (
     AdsProfile,
@@ -222,7 +222,7 @@ async def _run_ad_product(
 
 
 async def _process_marketplace(
-    session: AsyncSession,
+    session_maker: async_sessionmaker[AsyncSession],
     *,
     profile_scoped_conn: AmazonAdsConnector,
     profile: AdsProfile,
@@ -234,16 +234,27 @@ async def _process_marketplace(
     poll_interval: float,
     max_seconds: float,
 ) -> None:
+    """Three-phase to keep DB sessions short-lived across long API polling:
+    1. Purge existing rows in a committed session (session closed after).
+    2. Fire + poll all reports in parallel (NO session held -- Railway's
+       Postgres proxy drops idle connections after ~5 min otherwise).
+    3. Bulk-insert new rows in a fresh session.
+    """
     platforms = [AD_PRODUCT_TO_PLATFORM[p] for p in ad_products]
-    await _purge_existing(
-        session,
-        start_date=start_date,
-        end_date=end_date,
-        marketplace_id=marketplace_id,
-        platforms=platforms,
-    )
+
+    # Phase 1: purge
+    async with session_maker() as session:
+        await _purge_existing(
+            session,
+            start_date=start_date,
+            end_date=end_date,
+            marketplace_id=marketplace_id,
+            platforms=platforms,
+        )
+        await session.commit()
+
+    # Phase 2: poll reports in parallel (no DB session)
     summary.reports_created += len(ad_products)
-    # Fire all three reports in parallel.
     tasks = [
         _run_ad_product(
             profile_scoped_conn,
@@ -258,44 +269,47 @@ async def _process_marketplace(
     results = await asyncio.gather(*tasks, return_exceptions=True)
     currency = profile.currency_code or MARKETPLACE_CURRENCY[marketplace_id]
 
-    for ad_product, result in zip(ad_products, results, strict=True):
-        platform = AD_PRODUCT_TO_PLATFORM[ad_product]
-        if isinstance(result, Exception):
-            summary.reports_failed.append(
-                f"{marketplace_id}:{ad_product}:{type(result).__name__}:{result}"
-            )
-            logger.warning(
-                "amazon_ads_etl report_failed marketplace=%s ad_product=%s error=%s",
-                marketplace_id, ad_product, result,
-            )
-            continue
-        summary.reports_completed += 1
-        rows = result or []
-        platform_rows = 0
-        platform_spend = Decimal("0")
-        for row in rows:
-            obj = _build_ad_spend_row(
-                row,
-                ad_product=ad_product,
-                marketplace_id=marketplace_id,
-                currency=currency,
-            )
-            if obj is None:
+    # Phase 3: insert (fresh session)
+    async with session_maker() as session:
+        for ad_product, result in zip(ad_products, results, strict=True):
+            platform = AD_PRODUCT_TO_PLATFORM[ad_product]
+            if isinstance(result, Exception):
+                summary.reports_failed.append(
+                    f"{marketplace_id}:{ad_product}:{type(result).__name__}:{result}"
+                )
+                logger.warning(
+                    "amazon_ads_etl report_failed marketplace=%s ad_product=%s error=%s",
+                    marketplace_id, ad_product, result,
+                )
                 continue
-            session.add(obj)
-            platform_rows += 1
-            platform_spend += obj.spend
-        summary.rows_inserted += platform_rows
-        summary.rows_by_platform[platform] = (
-            summary.rows_by_platform.get(platform, 0) + platform_rows
-        )
-        summary.spend_by_platform[platform] = (
-            summary.spend_by_platform.get(platform, 0.0) + float(platform_spend)
-        )
+            summary.reports_completed += 1
+            rows = result or []
+            platform_rows = 0
+            platform_spend = Decimal("0")
+            for row in rows:
+                obj = _build_ad_spend_row(
+                    row,
+                    ad_product=ad_product,
+                    marketplace_id=marketplace_id,
+                    currency=currency,
+                )
+                if obj is None:
+                    continue
+                session.add(obj)
+                platform_rows += 1
+                platform_spend += obj.spend
+            summary.rows_inserted += platform_rows
+            summary.rows_by_platform[platform] = (
+                summary.rows_by_platform.get(platform, 0) + platform_rows
+            )
+            summary.spend_by_platform[platform] = (
+                summary.spend_by_platform.get(platform, 0.0) + float(platform_spend)
+            )
+        await session.commit()
 
 
 async def run_amazon_ads_etl(
-    session: AsyncSession,
+    session_maker: async_sessionmaker[AsyncSession],
     *,
     start_date: date,
     end_date: date,
@@ -309,6 +323,9 @@ async def run_amazon_ads_etl(
     poll_interval: float = REPORT_POLL_INTERVAL_SECONDS,
     max_seconds: float = REPORT_POLL_MAX_SECONDS,
 ) -> AmazonAdsEtlSummary:
+    """Runs the Ads ETL against `session_maker`, opening/closing short-lived
+    sessions around each DB interaction so long API polls don't hold DB
+    connections idle (Railway's proxy drops them after ~5 minutes)."""
     marketplaces = tuple(marketplace_ids) if marketplace_ids else ALL_MARKETPLACES
     unknown = [m for m in marketplaces if m not in MARKETPLACE_REGION]
     if unknown:
@@ -346,7 +363,7 @@ async def run_amazon_ads_etl(
                 )
                 scoped = conn.for_profile(profile.profile_id)
                 await _process_marketplace(
-                    session,
+                    session_maker,
                     profile_scoped_conn=scoped,
                     profile=profile,
                     marketplace_id=mp,
@@ -358,7 +375,6 @@ async def run_amazon_ads_etl(
                     max_seconds=max_seconds,
                 )
 
-    await session.flush()
     return summary
 
 

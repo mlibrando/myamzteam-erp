@@ -15,7 +15,9 @@ import asyncio
 import gzip
 import json
 import logging
+import re
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -120,6 +122,38 @@ METRICS_BY_AD_PRODUCT: dict[str, tuple[str, ...]] = {
     "SPONSORED_BRANDS": SB_METRICS,
     "SPONSORED_DISPLAY": SD_METRICS,
 }
+
+
+# Regex for the Ads v3 duplicate-report message.
+# Example body: {"code":"425","detail":"The Request is a duplicate of : <uuid>"}
+_DUPLICATE_REPORT_ID_RE = re.compile(
+    r"duplicate of\s*:\s*([0-9a-fA-F-]{8,})", re.IGNORECASE
+)
+
+
+def _extract_duplicate_report_id(body_text: str) -> str | None:
+    """Parse the existing reportId out of a 425 response. Tolerates JSON
+    decode failures (returns None) and minor wording variations."""
+    # Try JSON first
+    try:
+        body = json.loads(body_text)
+    except (TypeError, ValueError):
+        body = None
+    if isinstance(body, dict):
+        # Some accounts surface the existing ID under a typed field.
+        for key in ("duplicateReportId", "existingReportId", "reportId"):
+            value = body.get(key)
+            if value:
+                return str(value)
+        detail = body.get("detail") or body.get("message") or ""
+        match = _DUPLICATE_REPORT_ID_RE.search(detail)
+        if match:
+            return match.group(1)
+    # Fallback: raw text search in case body isn't JSON.
+    match = _DUPLICATE_REPORT_ID_RE.search(body_text or "")
+    if match:
+        return match.group(1)
+    return None
 
 
 @dataclass
@@ -296,8 +330,19 @@ class AmazonAdsConnector(BaseConnector):
             raise ValueError(f"unknown ad_product: {ad_product}")
         report_type_id = REPORT_TYPE_ID_BY_AD_PRODUCT[ad_product]
         metrics = METRICS_BY_AD_PRODUCT[ad_product]
+        # Include a short uuid in the default name so Amazon's create-report
+        # dedup (which keys on name + configuration) never reuses a stale
+        # report from a prior ETL invocation. Reports occasionally stay
+        # PENDING indefinitely on Amazon's side; if we let dedup point us
+        # back to one of those, the whole window's worth of reports hangs.
+        # The 425 handler below still catches true within-invocation
+        # duplicates (e.g. retried POSTs from network flakes).
+        default_name = (
+            f"{ad_product} campaigns {start_date} {end_date} "
+            f"{uuid.uuid4().hex[:8]}"
+        )
         body = {
-            "name": name or f"{ad_product} campaigns {start_date} {end_date}",
+            "name": name or default_name,
             "startDate": start_date,
             "endDate": end_date,
             "configuration": {
@@ -316,7 +361,28 @@ class AmazonAdsConnector(BaseConnector):
             rate_limit=REPORT_CREATE_RATE,
             json=body,
             headers={"Content-Type": "application/vnd.createasyncreportrequest.v3+json"},
+            allowed_statuses={425},
         )
+        if response.status_code == 425:
+            # Amazon Ads v3 returns 425 when an identical report request
+            # (same name + configuration) was submitted within the dedup
+            # window. The existing reportId is embedded in the response
+            # `detail` field. Reuse it rather than failing -- callers
+            # expect idempotency over the (ad_product, window) tuple.
+            existing_id = _extract_duplicate_report_id(response.text)
+            if not existing_id:
+                raise ConnectorError(
+                    f"create_campaign_report got 425 but could not parse "
+                    f"duplicate reportId from body: {response.text}"
+                )
+            logger.info(
+                "amazon_ads report_deduped ad_product=%s existing_report_id=%s region=%s",
+                ad_product,
+                existing_id,
+                self.region,
+            )
+            return existing_id
+
         data = response.json()
         report_id = data.get("reportId")
         if not report_id:
