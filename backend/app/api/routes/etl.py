@@ -19,6 +19,7 @@ from app.etl.amazon_etl import (
     run_amazon_by_group_reconciliation,
     run_amazon_etl,
 )
+from app.etl.amazon_settlement_etl import run_amazon_settlement_ingestion
 from app.etl.pnl_calculator import calculate_daily_pnl
 
 logger = logging.getLogger(__name__)
@@ -167,6 +168,60 @@ async def reconcile_by_group(
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"by-group reconciliation failed: {exc}",
+        ) from exc
+
+    pnl_summary: dict[str, Any] = {"skipped": True}
+    if not request.skip_pnl_calc:
+        pnl_calc = await calculate_daily_pnl(
+            db,
+            start_date=request.window_start_pt,
+            end_date=request.window_end_pt,
+            marketplace_ids=marketplaces,
+        )
+        pnl_summary = {
+            "rows_written": pnl_calc.rows_written,
+            "skus_without_cogs": pnl_calc.skus_without_cogs,
+        }
+
+    await db.commit()
+    return AmazonEtlResponse(etl=recon_summary.to_dict(), pnl=pnl_summary)
+
+
+@router.post(
+    "/etl/amazon/ingest-settlement-taxes",
+    response_model=AmazonEtlResponse,
+)
+async def ingest_settlement_taxes(
+    request: AmazonByGroupReconciliationRequest,
+    db: AsyncSession = Depends(get_db),
+) -> AmazonEtlResponse:
+    """Ingest Taxes-remitted-to-Amazon lines from settlement reports for
+    the given PT-local window. Only rows whose amount-description matches
+    MarketplaceFacilitatorTax*, MarketplaceFacilitatorVAT*, or TaxWithheld
+    are inserted (source='settlement', category='selling_fees'). Every
+    other row in the settlement report is skipped since it's already
+    captured by the daily by-date ETL or the monthly by-group
+    reconciliation. Safe to run repeatedly."""
+    marketplaces = request.marketplace_ids or list(ALL_MARKETPLACES)
+    logger.info(
+        "settlement_ingestion_route start_pt=%s end_pt=%s marketplaces=%s",
+        request.window_start_pt,
+        request.window_end_pt,
+        marketplaces,
+    )
+    try:
+        recon_summary = await run_amazon_settlement_ingestion(
+            db,
+            window_start_pt=request.window_start_pt,
+            window_end_pt=request.window_end_pt,
+            marketplace_ids=marketplaces,
+        )
+    except Exception as exc:
+        await db.rollback()
+        logger.exception("settlement_ingestion_route failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"settlement ingestion failed: {exc}",
         ) from exc
 
     pnl_summary: dict[str, Any] = {"skipped": True}
