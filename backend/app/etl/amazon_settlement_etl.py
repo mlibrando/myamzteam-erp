@@ -101,6 +101,7 @@ class SettlementEtlSummary:
     window_end_pt: date | None = None
     reports_listed: int = 0
     reports_processed: int = 0
+    reports_skipped_as_duplicate: int = 0
     rows_scanned: int = 0
     tax_rows_matched: int = 0
     rows_deleted: int = 0
@@ -115,6 +116,7 @@ class SettlementEtlSummary:
             "window_end_pt": self.window_end_pt.isoformat() if self.window_end_pt else None,
             "reports_listed": self.reports_listed,
             "reports_processed": self.reports_processed,
+            "reports_skipped_as_duplicate": self.reports_skipped_as_duplicate,
             "rows_scanned": self.rows_scanned,
             "tax_rows_matched": self.tax_rows_matched,
             "rows_deleted": self.rows_deleted,
@@ -161,6 +163,19 @@ def parse_settlement_report(raw_bytes: bytes, *, compression: str | None = None)
     text = body.decode("utf-8-sig")
     reader = csv.DictReader(io.StringIO(text), delimiter="\t")
     return [row for row in reader if any(v.strip() for v in row.values() if v is not None)]
+
+
+def _first_settlement_id(rows: list[dict[str, str]]) -> str | None:
+    """Return the first non-empty settlement-id value found in the rows.
+
+    Every row in a settlement report shares the same settlement-id (they
+    all belong to one disbursement cycle), so peeking at the first
+    populated one is sufficient to identify the report."""
+    for row in rows:
+        sid = (row.get(_COL_SETTLEMENT_ID) or "").strip()
+        if sid:
+            return sid
+    return None
 
 
 async def _purge_settlement_rows(
@@ -300,6 +315,23 @@ async def run_amazon_settlement_ingestion(
 
     for region, region_marketplaces in regions_needed.items():
         region_marketplaces_set = set(region_marketplaces)
+        # Amazon may return multiple report VERSIONS (different reportId,
+        # different reportDocumentId) for the same underlying SETTLEMENT
+        # (same settlement-id) — presumably initial + revised copies of
+        # the same biweekly disbursement. Track processed settlement-ids
+        # so we don't insert the same disbursement's rows twice when
+        # Amazon does emit revisions.
+        seen_settlement_ids: set[str] = set()
+        # And separately: within a single run (across all reports we do
+        # process), track individual row identities so a row that appears
+        # in overlapping reports — e.g. a boundary transaction that sits
+        # in both settlement A's tail and settlement B's head — lands
+        # exactly once. Key on the tuple that uniquely identifies an
+        # Amazon financial event: (settlement-id, transaction-type,
+        # amount-type, amount-description, amount, posted-date-time,
+        # order-id). Empirically closes the last few $ of drift versus
+        # Elena's aggregated Sellerise "Taxes" line for May 2026 US.
+        seen_row_keys: set[tuple[str, ...]] = set()
         async with factory(region) as conn:
             logger.info(
                 "settlement_ingestion region=%s marketplaces=%s window=%s..%s "
@@ -336,6 +368,20 @@ async def run_amazon_settlement_ingestion(
                     raw_bytes,
                     compression=document.get("compressionAlgorithm"),
                 )
+                # Peek at the first non-empty settlement-id in the file
+                # to check whether we've already ingested this settlement.
+                report_settlement_id = _first_settlement_id(rows)
+                if report_settlement_id and report_settlement_id in seen_settlement_ids:
+                    logger.info(
+                        "settlement_ingestion skipping duplicate settlement-id=%s "
+                        "(reportId=%s already covered by an earlier report version)",
+                        report_settlement_id,
+                        report.get("reportId"),
+                    )
+                    summary.reports_skipped_as_duplicate += 1
+                    continue
+                if report_settlement_id:
+                    seen_settlement_ids.add(report_settlement_id)
                 summary.reports_processed += 1
                 summary.rows_scanned += len(rows)
 
@@ -381,6 +427,23 @@ async def run_amazon_settlement_ingestion(
                     marketplace_id = fallback_marketplace
                     if marketplace_id not in region_marketplaces_set:
                         continue
+
+                    # Row-level dedup — a small number of tax rows repeat
+                    # across overlapping Amazon reports even after the
+                    # settlement-id dedup above. Skip a row identity we
+                    # already ingested this run.
+                    row_key = (
+                        (row.get(_COL_SETTLEMENT_ID) or "").strip(),
+                        (row.get(_COL_TRANSACTION_TYPE) or "").strip(),
+                        (row.get(_COL_AMOUNT_TYPE) or "").strip(),
+                        amount_description,
+                        (row.get(_COL_AMOUNT) or "").strip(),
+                        (row.get(_COL_POSTED_DATE_TIME) or "").strip(),
+                        (row.get(_COL_ORDER_ID) or "").strip(),
+                    )
+                    if row_key in seen_row_keys:
+                        continue
+                    seen_row_keys.add(row_key)
 
                     flat = _tax_row_to_flat(
                         row,
