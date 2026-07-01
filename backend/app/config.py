@@ -22,6 +22,13 @@ class Settings(BaseSettings):
 
     AMAZON_ADS_CLIENT_ID: str = ""
     AMAZON_ADS_CLIENT_SECRET: str = ""
+    # NA is the primary Ads refresh token. EU and FE are OPTIONAL: when unset,
+    # the connector falls back to the NA token. A single LWA authorization
+    # spans all three regions when the seller login has access to marketplaces
+    # in each — verified for the MagicalButter account 2026-07 (see
+    # AmazonAdsConnector._refresh_token_for). Set the regional vars
+    # explicitly only if the seller has separated accounts per region and
+    # each region needs its own OAuth flow.
     AMAZON_ADS_REFRESH_TOKEN_NA: str = ""
     AMAZON_ADS_REFRESH_TOKEN_EU: str = ""
     AMAZON_ADS_REFRESH_TOKEN_FE: str = ""

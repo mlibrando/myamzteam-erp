@@ -131,6 +131,53 @@ async def test_missing_credentials_raises():
         )
 
 
+def test_refresh_token_falls_back_to_na_when_regional_unset(monkeypatch):
+    """A single LWA authorization often spans all three regions; when the
+    seller only provides AMAZON_ADS_REFRESH_TOKEN_NA, the EU/FE connectors
+    must fall back to it rather than raising AuthError."""
+    from app.connectors.amazon_ads import AmazonAdsConnector
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "AMAZON_ADS_REFRESH_TOKEN_NA", "Atzr|na-shared", raising=False)
+    monkeypatch.setattr(settings, "AMAZON_ADS_REFRESH_TOKEN_EU", "", raising=False)
+    monkeypatch.setattr(settings, "AMAZON_ADS_REFRESH_TOKEN_FE", "", raising=False)
+
+    assert AmazonAdsConnector._refresh_token_for("NA") == "Atzr|na-shared"
+    assert AmazonAdsConnector._refresh_token_for("EU") == "Atzr|na-shared"
+    assert AmazonAdsConnector._refresh_token_for("FE") == "Atzr|na-shared"
+
+
+def test_regional_refresh_token_wins_when_explicitly_set(monkeypatch):
+    """If the seller has separated accounts and set region-specific tokens,
+    those must take precedence over the NA fallback."""
+    from app.connectors.amazon_ads import AmazonAdsConnector
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "AMAZON_ADS_REFRESH_TOKEN_NA", "Atzr|na-only", raising=False)
+    monkeypatch.setattr(settings, "AMAZON_ADS_REFRESH_TOKEN_EU", "Atzr|eu-specific", raising=False)
+    monkeypatch.setattr(settings, "AMAZON_ADS_REFRESH_TOKEN_FE", "Atzr|fe-specific", raising=False)
+
+    assert AmazonAdsConnector._refresh_token_for("NA") == "Atzr|na-only"
+    assert AmazonAdsConnector._refresh_token_for("EU") == "Atzr|eu-specific"
+    assert AmazonAdsConnector._refresh_token_for("FE") == "Atzr|fe-specific"
+
+
+def test_missing_na_token_still_raises_for_eu_and_fe(monkeypatch):
+    """If NA is unset and a regional token isn't provided, there's no
+    fallback to use — construction must fail rather than silently
+    authenticating with an empty string."""
+    from app.connectors.amazon_ads import AmazonAdsConnector
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "AMAZON_ADS_REFRESH_TOKEN_NA", "", raising=False)
+    monkeypatch.setattr(settings, "AMAZON_ADS_REFRESH_TOKEN_EU", "", raising=False)
+    monkeypatch.setattr(settings, "AMAZON_ADS_REFRESH_TOKEN_FE", "", raising=False)
+
+    assert AmazonAdsConnector._refresh_token_for("EU") == ""
+    with pytest.raises(AuthError):
+        AmazonAdsConnector(region="EU", client_id="cid", client_secret="cs")
+
+
 # -----------------------------------------------------------------------------
 # Profiles
 # -----------------------------------------------------------------------------

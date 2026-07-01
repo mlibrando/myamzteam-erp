@@ -223,11 +223,33 @@ class AmazonAdsConnector(BaseConnector):
 
     @staticmethod
     def _refresh_token_for(region: Region) -> str:
-        return {
+        """Return the refresh token for `region`, falling back to the NA token
+        when the region-specific env var isn't set.
+
+        This works because a single LWA authorization can authenticate calls
+        against all three regional Ads endpoints when the seller login has
+        access to marketplaces in each region — verified 2026-07 for the
+        MagicalButter account. In that case:
+          - NA endpoint returned US/CA/MX/BR profiles under seller
+            account A348DWHA5R9ZQL
+          - EU endpoint returned UK/DE/FR/IT/ES/NL/IE/SE/PL/TR/AE profiles
+            under seller account AEXHDCLX193WF
+          - FE endpoint returned AU profile under seller account
+            A1DT6S189BMA8X
+        One LWA app spanning three distinct seller-account IDs happens because
+        they're all linked to the same Amazon login.
+
+        Set `AMAZON_ADS_REFRESH_TOKEN_EU` / `_FE` explicitly to force a
+        region-specific token — needed if the seller ever separates the
+        underlying Amazon accounts, or if regional data policies require
+        distinct authorizations.
+        """
+        regional = {
             "NA": settings.AMAZON_ADS_REFRESH_TOKEN_NA,
             "EU": settings.AMAZON_ADS_REFRESH_TOKEN_EU,
             "FE": settings.AMAZON_ADS_REFRESH_TOKEN_FE,
         }[region]
+        return regional or settings.AMAZON_ADS_REFRESH_TOKEN_NA
 
     def for_profile(self, profile_id: str) -> "AmazonAdsConnector":
         """Return a new connector instance scoped to a profile, sharing the
