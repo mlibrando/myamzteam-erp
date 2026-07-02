@@ -293,14 +293,24 @@ Daily ETL is unchanged — by-date remains the correct primitive for daily P&L. 
 ### PR 5: Scheduler + Automated Daily Runs
 **Branch**: `feat/scheduler`
 
-- APScheduler configuration for daily ETL jobs
-- Job: Amazon SP-API pull (revenue + fees) - runs daily at 6 AM UTC
-- Job: Amazon Ads pull (SP/SB/SD spend) - runs daily at 6:30 AM UTC
-- Job: P&L recalculation - runs daily at 7 AM UTC (after all pulls complete)
-- Error handling: retry logic, failure alerts (log-based initially, Slack webhook later)
-- Idempotency: re-running for same date overwrites, doesn't duplicate
+Daily jobs (all UTC, pull yesterday's data):
+- Job: Amazon SP-API pull (revenue + fees) — 06:00 UTC
+- Job: Amazon Ads pull (SP/SB/SD spend) — 06:30 UTC
+- Job: P&L recalculation — 07:00 UTC (after all pulls complete)
 
-**Validation**: Let scheduler run for 2-3 days, verify daily_pnl populates automatically
+Monthly jobs (all UTC, PT-anchored calendar months):
+- Day 10 10:00 — by-group reconciliation for the just-closed prior month (closes ~$4.4k Op Fees gap)
+- Day 10 11:00 — settlement Taxes ingestion for the just-closed prior month (closes ~$11k Selling Fees gap)
+- Day 15 10:00 — catch-up settlement Taxes re-run for the month before the prior month (late-arriving adjustments)
+- Day 15 12:00 — full P&L recalculation covering both reconciled months
+
+- Error handling: each job catches and logs its own exceptions; one failure never kills the scheduler process
+- Idempotency: re-running for the same date/month overwrites, never duplicates
+- `ETL_SCHEDULE_ENABLED=False` config flag suppresses scheduler startup (CI, ad-hoc scripts)
+- `GET /api/scheduler/status` endpoint returns running state and next fire times
+- Manual overrides always available via `/api/etl/*` endpoints
+
+**Validation**: Let scheduler run for 2-3 days, verify daily_pnl populates automatically; verify monthly jobs fire on day 10/15
 
 ---
 
