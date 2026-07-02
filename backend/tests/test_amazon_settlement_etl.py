@@ -286,3 +286,77 @@ async def test_settlement_ingestion_excludes_rows_outside_window() -> None:
         assert session.added_events[0].posted_date == datetime(
             2026, 1, 10, 8, 0, 0, tzinfo=timezone.utc
         )
+
+
+async def test_settlement_ingestion_dedupes_reports_by_settlement_id() -> None:
+    """Amazon returns multiple report versions for the same settlement
+    (different reportId + reportDocumentId, same settlement-id inside).
+    Only the first report seen per settlement-id should be processed;
+    subsequent duplicates must be skipped, not double-inserted."""
+    base = REGION_BASE_URLS["NA"]
+
+    # Same settlement-id "SETTLE-A" produced by two "revision" reports
+    # (rpt-1 + rpt-2) plus a distinct settlement "SETTLE-B" in rpt-3.
+    def _tsv(settlement_id: str, amount: str) -> str:
+        return (
+            "settlement-id\ttransaction-type\tamount-type\tamount-description\t"
+            "amount\tposted-date-time\tcurrency\tmarketplace-name\torder-id\tsku\n"
+            f"{settlement_id}\tOrder\tItemFees\tMarketplaceFacilitatorTax-Principal\t"
+            f"{amount}\t2026-01-10 08:00:00 UTC\tUSD\tamazon.com\t111-A\tSKU-A\n"
+        )
+
+    with respx.mock(assert_all_called=False) as mock:
+        _token_route(mock)
+        mock.get(f"{base}/reports/2021-06-30/reports").mock(
+            return_value=httpx.Response(
+                200,
+                json={"reports": [
+                    {"reportId": "rpt-1", "reportType": SETTLEMENT_REPORT_TYPE,
+                     "reportDocumentId": "doc-1", "dataStartTime": "2026-01-01T00:00:00Z",
+                     "dataEndTime": "2026-01-14T00:00:00Z", "processingStatus": "DONE"},
+                    {"reportId": "rpt-2", "reportType": SETTLEMENT_REPORT_TYPE,
+                     "reportDocumentId": "doc-2", "dataStartTime": "2026-01-01T00:00:00Z",
+                     "dataEndTime": "2026-01-14T00:00:00Z", "processingStatus": "DONE"},
+                    {"reportId": "rpt-3", "reportType": SETTLEMENT_REPORT_TYPE,
+                     "reportDocumentId": "doc-3", "dataStartTime": "2026-01-15T00:00:00Z",
+                     "dataEndTime": "2026-01-28T00:00:00Z", "processingStatus": "DONE"},
+                ]},
+            )
+        )
+        for doc_id in ("doc-1", "doc-2", "doc-3"):
+            mock.get(f"{base}/reports/2021-06-30/documents/{doc_id}").mock(
+                return_value=httpx.Response(
+                    200,
+                    json={"reportDocumentId": doc_id, "url": f"https://s3.example/{doc_id}"},
+                )
+            )
+        # rpt-1 and rpt-2 both carry settlement-id "SETTLE-A" with the same
+        # $10 tax row; rpt-3 carries settlement-id "SETTLE-B" with $7.
+        mock.get("https://s3.example/doc-1").mock(
+            return_value=httpx.Response(200, content=_tsv("SETTLE-A", "-10.00").encode("utf-8"))
+        )
+        mock.get("https://s3.example/doc-2").mock(
+            return_value=httpx.Response(200, content=_tsv("SETTLE-A", "-10.00").encode("utf-8"))
+        )
+        mock.get("https://s3.example/doc-3").mock(
+            return_value=httpx.Response(200, content=_tsv("SETTLE-B", "-7.00").encode("utf-8"))
+        )
+
+        session = MockSession()
+        summary = await run_amazon_settlement_ingestion(
+            session,  # type: ignore[arg-type]
+            window_start_pt=date(2026, 1, 1),
+            window_end_pt=date(2026, 1, 31),
+            marketplace_ids=["ATVPDKIKX0DER"],
+            connector_factory=lambda region: AmazonSPConnector(region=region, **CREDS),
+        )
+
+        assert summary.reports_listed == 3
+        assert summary.reports_processed == 2  # doc-1 + doc-3 (doc-2 is a duplicate)
+        assert summary.reports_skipped_as_duplicate == 1
+        # Two rows inserted total (one per settlement), not three
+        assert summary.rows_inserted == 2
+        assert len(session.added_events) == 2
+        # Amounts: SETTLE-A -$10 + SETTLE-B -$7 = -$17 raw; fee_amount magnitude $17
+        fee_totals = sorted(float(e.fee_amount) for e in session.added_events)
+        assert fee_totals == [7.00, 10.00]
