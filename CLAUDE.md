@@ -55,9 +55,16 @@ Meta Marketing API (ad spend) ─────┘         │
 
 ## Settlement ETL cadence + expected drift
 
-Operating notes for the settlement ingestion so the scheduler (PR 5) and future manual runs are aligned:
+Monthly reconciliation (by-group + settlement Taxes) is **scheduled automatically** by the PR 5 scheduler. Manual re-runs are always available via `POST /api/etl/amazon/reconcile-by-group` and `POST /api/etl/amazon/ingest-settlement-taxes`.
 
-- **Cadence: monthly, ideally biweekly.** Amazon closes settlement cycles biweekly, and each closed cycle publishes a settlement report ~1-2 days later. Running the ETL monthly is sufficient for the P&L; running biweekly picks up each cycle sooner. Weekly gives you nothing extra — settlements don't finalize any faster than biweekly.
+Scheduled cadence (all UTC, operates on PT-anchored calendar months):
+- **Day 10 10:00** — by-group reconciliation for the just-closed (prior) month. Closes the ~$4.4k Op Fees gap.
+- **Day 10 11:00** — settlement Taxes ingestion for the just-closed month. Closes the ~$11k Selling Fees gap.
+- **Day 15 10:00** — catch-up settlement Taxes re-run for the month before the just-closed month. Picks up late-arriving refund reversals and post-hoc tax adjustments.
+- **Day 15 12:00** — full P&L recalculation covering both reconciled months.
+
+Day 10 (not day 5) gives Amazon's last biweekly settlement cycle of the prior month time to close and publish (~1-2 days after cycle end). Day 15 reduces the ±5-8% snapshot drift by re-running after the adjustment tail has arrived.
+
 - **Re-run each just-closed month ~2-3 weeks after month-end.** Late-arriving refund reversals and post-hoc tax adjustments continue to trickle into settlement reports for a couple of weeks after the calendar month closes. Running once at month-end captures ~90% of the month's tax activity; re-running mid-next-month picks up the remaining tail.
 - **Expected residual: ±5-8% vs Sellerise for mostly-settled months.** Elena's Sellerise exports and our SP-API view are both moving snapshots — they line up within a few percent but not exactly. Multi-month validation (2026-07-02) showed April at -4.82% (Elena over us), May at +7.03% (us over Elena) — same magnitude range, sign flips month to month, indicating **snapshot noise, not systematic bias**. This drift is fundamental to how Amazon financial data works, not something we can eliminate. See [backend/scripts/validate_settlement_taxes_cross_month.py](backend/scripts/validate_settlement_taxes_cross_month.py) to spot-check drift for any month.
 - **The current month will under-report until settlement closes.** June 2026 measured at only -40.2% of Elena's target the day validation ran — expected, because Amazon hadn't published the settlement reports for late-June yet. Don't panic about the current month's number; re-run once its cycle closes.
